@@ -1,8 +1,16 @@
 <template>
   <Header />
-  <HelloWorld msg="Hello Aaron!" :c='999'/>
-  <BasicDiv msg="Here's a basic div for you to play with" @kaboom-button="console.log('emissions passed 💣')"/>
-  <CustomComponent msg="!noraA olleH"/>
+  <HelloWorld 
+    msg="Hello Aaron!" 
+    :c="1"/>
+  <BasicDiv 
+    msg="Here's a basic div for you to play with" 
+    :c="17" 
+    @kaboom-button="console.log('emissions passed 💣')"
+    />
+  <HelloWorld 
+    msg="!noraA olleH"
+    :c="-1"/>
 </template>
 
 <script>
