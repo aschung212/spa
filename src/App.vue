@@ -1,7 +1,7 @@
 <template>
   <Header />
-  <HelloWorld msg="Hello Aaron!" />
-  <BasicDiv msg="Here's a basic div for you to play with" />
+  <HelloWorld msg="Hello Aaron!" :c='999'/>
+  <BasicDiv msg="Here's a basic div for you to play with" @kaboom-button="console.log('emissions passed 💣')"/>
   <CustomComponent msg="!noraA olleH"/>
 </template>
 
