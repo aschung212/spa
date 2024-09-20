@@ -13,6 +13,11 @@ body {
   font-weight: 500;
 }
 
+.bikes {
+  display: flex;
+  flex-wrap: nowrap;
+}
+
 .basicDiv {
   font-weight: 200;
   font-size: 16px;
