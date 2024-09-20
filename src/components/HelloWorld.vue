@@ -9,17 +9,16 @@
 </template>
 
 <script>
-
-export default {
-  name: 'HelloWorld',
-  props: {
-    msg: String,
-    c: Number
-  },
-  data() {
-    return {
-      count: 0
+  export default {
+    name: 'HelloWorld',
+    props: {
+      msg: String,
+      c: Number
+    },
+    data() {
+      return {
+        count: 0
+      }
     }
   }
-}
 </script>
