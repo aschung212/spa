@@ -1,15 +1,18 @@
 <template>
-  <img alt="Vue logo" src="./assets/logo.png" />
-  <HelloWorld msg="Hello Vue 3.0 + Vite" />
+  <img alt="Ducati logo" src="./assets/logo.png" />
+  <HelloWorld msg="Hello Aaron!" />
+  <CustomComponent msg="custom message"/>
 </template>
 
 <script>
 import HelloWorld from './components/HelloWorld.vue'
+import CustomComponent from './components/CustomComponent.vue'
 
 export default {
   name: 'App',
   components: {
-    HelloWorld
+    HelloWorld,
+    CustomComponent
   }
 }
 </script>
