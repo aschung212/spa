@@ -6,7 +6,10 @@
   <BasicDiv 
     msg="Here's a basic div for you to play with" 
     :c="17" 
-    @kaboom-button="console.log('emissions passed 💣')"
+    @kaboom-button="console.log('emissions passed. Detonating in 3... 2.. 1 💣')"
+    @randomize-button="console.log('shuffling...♠️♥️♣️♦️')"
+    @increment-button="console.log('up, up, and away🚀')"
+    @decrement-button="console.log('down bad📉')"
     />
   <HelloWorld 
     msg="!noraA olleH"
