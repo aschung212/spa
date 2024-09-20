@@ -1,8 +1,10 @@
 <template>
-  <h1>{{ msg }}</h1>
-  <h2>count is: {{ count }}</h2>
-  <button @click="count--">-1</button>
-  <button @click="count=0">reset</button>
+  <div :class="['countContainer', count%2 === 0 ? 'evenCount' : 'oddCount']">
+    <h1>{{ msg }}</h1>
+    <h2>count: {{ count }}</h2>
+    <button @click="count--" class="counterButton">-1</button>
+    <button @click="count = 0" type="button" class="resetButton">Reset</button>
+  </div>
 </template>
 
 <script>

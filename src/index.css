@@ -4,11 +4,64 @@
   -moz-osx-font-smoothing: grayscale;
   text-align: center;
   color: #2c3e50;
-  margin-top: 60px;
+  margin-top: 10px;
 }
 
-.basicdivtest {
-  color: green;
+body {
+  background-color: lightblue;
+  font-size: 24px;
+  font-weight: 500;
+}
+
+.basicDiv {
+  font-weight: 200;
+  font-size: 16px;
+  color: red;
+  border-radius: 50px;
   background-color: beige;
-  padding: 50px;
+  padding: 100px;
+  margin: 20px 0;
+}
+
+.basicDivButtonBox {
+  display: flex;
+  justify-content: space-evenly;
+  flex-direction: row;
+}
+
+.customButton {
+  width: 100px;
+  height: 100px;
+  border-radius: 50px;
+  font-size: 12px;
+  border-color: lightblue;
+}
+
+.countContainer {
+  border-radius: 25px;
+  padding: 20px;
+  background-color: red;
+}
+
+.counterButton {
+  width: 50px;
+  margin: 0 10px;
+  border-radius: 10px;
+  border-color: white;
+}
+
+.resetButton {
+  width: 50px;
+  margin: 0 10px;
+  border-radius: 10px;
+  border-color: white;
+  color: red
+}
+
+.evenCount {
+  color: beige;
+}
+
+.oddCount {
+  color: black;
 }
