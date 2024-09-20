@@ -1,7 +1,8 @@
 <template>
   <h1>{{ msg }}</h1>
-  <button @click="count--">count is: {{ count }}</button>
-  <p>This is my custom component</p>
+  <h2>count is: {{ count }}</h2>
+  <button @click="count--">-1</button>
+  <button @click="count=0">reset</button>
 </template>
 
 <script>

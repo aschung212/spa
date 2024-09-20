@@ -1,7 +1,8 @@
 <template>
   <img alt="Ducati logo" src="./assets/logo.png" />
   <HelloWorld msg="Hello Aaron!" />
-  <CustomComponent msg="custom message"/>
+  <div class="basicdivtest">Here's a basic div for you to play with</div>
+  <CustomComponent msg="!noraA olleH"/>
 </template>
 
 <script>
