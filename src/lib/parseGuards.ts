@@ -145,6 +145,14 @@ export function parseExercise(value: unknown): Exercise | null {
   const notes = sanitizeExerciseNotes(o.notes)
   if (notes) ex.notes = notes
   if (o.bodyweightLoaded === true) ex.bodyweightLoaded = true
+  // Absorbed same-named duplicate ids (LIFT-1335). Hydrated because a delete
+  // must reach those rows even on a cold start that has not fetched yet — the
+  // field is otherwise only ever written by `deduplicateByName` during a fetch.
+  // A self-reference is dropped so the list stays strictly "other rows".
+  if (o.mergedFrom !== undefined) {
+    const mergedFrom = parseStringArray(o.mergedFrom).filter(id => id !== ex.id)
+    if (mergedFrom.length > 0) ex.mergedFrom = [...new Set(mergedFrom)]
+  }
   if (typeof o.updated_at === 'string') ex.updated_at = o.updated_at
   if (typeof o.archived_at === 'string') ex.archived_at = o.archived_at
   if (o.sample === true) ex.sample = true
