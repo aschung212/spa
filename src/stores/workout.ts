@@ -19,6 +19,7 @@ import { sanitizeExerciseNotes } from '../lib/inputLimits'
 import { sanitizeExerciseEquipment, type ExerciseEquipment } from '../lib/coachAnalytics'
 import { sanitizeExerciseGyms } from '../lib/gyms'
 import { mapRemoteExercise, mapRemoteSet } from '../lib/remoteRows'
+import { captureLocalOnlySetFields, restoreLocalOnlySetFields } from '../lib/localOnlySetFields'
 import { fetchAllRows } from '../lib/supabasePagination'
 import { bodyweightFold, effectiveSetWeight } from '../lib/bodyweightLoad'
 import { attemptedNextRep, pickTopSet } from '../lib/setEffort'
@@ -613,6 +614,12 @@ export const useWorkoutStore = defineStore('workout', () => {
       ex.sets = remoteSetsMap.get(ex.id) || []
     })
 
+    // Index the per-set fields the server has no column for, BEFORE the merge
+    // can hand a set's slot to the remote copy of itself (#1357). Keyed by set
+    // id, so it survives however the merge and the two dedup passes below
+    // reshuffle sets between exercises.
+    const localOnlySetFields = captureLocalOnlySetFields(exercises.value)
+
     // Merge with local state using last-write-wins conflict resolution
     // (#1 fix: local exercises now carry updated_at from mutations)
     const localWithTimestamps = exercises.value.map(ex => ({
@@ -670,6 +677,13 @@ export const useWorkoutStore = defineStore('workout', () => {
       const { unique } = deduplicateSets(ex.sets)
       ex.sets = unique
     }
+
+    // Re-attach RPE and captured bodyweight to any set that arrived from the
+    // server (#1357). Runs after BOTH dedup passes so it covers every set about
+    // to be committed, not just the ones the last-write-wins union touched —
+    // the alternative, patching the union loop alone, would leave the same hole
+    // open for any future path that adopts a remote set.
+    restoreLocalOnlySetFields(deduped.exercises, localOnlySetFields)
 
     exercises.value = deduped.exercises
     _invalidateDayCounts()
