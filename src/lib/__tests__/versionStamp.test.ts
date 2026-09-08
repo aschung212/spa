@@ -12,6 +12,22 @@ import versionStampPlugin, {
 //   - it emits at the well-known root path `version.json` the smoke test polls
 
 describe('buildVersionInfo (LIFT-1167)', () => {
+  // LIFT-1169: CI now runs `vercel build` itself, so the commit it checked out
+  // is what is being deployed and the workflow says so explicitly. That has to
+  // outrank VERCEL_GIT_COMMIT_SHA, because `vercel pull` writes
+  // .vercel/.env.production.local and `vercel build` injects it into the build
+  // env — a SHA from there describes some other deployment. Stamping it would
+  // make smoke-test-production poll for a commit production never serves and
+  // fail after 300s on every single deploy.
+  it('prefers the explicit CI deploy stamp over every ambient SHA', () => {
+    const info = buildVersionInfo({
+      LIFT_BUILD_COMMIT: 'ci-deploy-sha',
+      VERCEL_GIT_COMMIT_SHA: 'stale-pulled-sha',
+      GITHUB_SHA: 'github-sha',
+    })
+    expect(info.commit).toBe('ci-deploy-sha')
+  })
+
   it('prefers VERCEL_GIT_COMMIT_SHA over GITHUB_SHA', () => {
     const info = buildVersionInfo({
       VERCEL_GIT_COMMIT_SHA: 'vercel-sha',
@@ -25,7 +41,7 @@ describe('buildVersionInfo (LIFT-1167)', () => {
     expect(info.commit).toBe('github-sha')
   })
 
-  it('uses an empty commit when neither var is set (local build)', () => {
+  it('uses an empty commit when no var is set (local build)', () => {
     const info = buildVersionInfo({})
     expect(info.commit).toBe('')
   })

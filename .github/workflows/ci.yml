@@ -666,7 +666,14 @@ jobs:
           retention-days: 7
 
   # Push unapplied Supabase migrations on merge to master.
-  # Runs before Vercel deploys so the DB schema is ready for the new code.
+  #
+  # This genuinely runs before production serves the new code, but only because
+  # `deploy-production` (below) needs it and is now the ONLY path to production
+  # (LIFT-1169). It used to claim the same thing while Vercel's git integration
+  # deployed on push, independently of this workflow and minutes ahead of this
+  # job — so code depending on a fresh column went live and errored for users
+  # until the migration caught up. A `needs:` edge is a real happens-before; a
+  # comment is not.
   migrate-db:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -711,27 +718,44 @@ jobs:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
           SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
 
-  # Verify Vercel actually promoted this commit to production BEFORE claiming
-  # a successful deploy (LIFT-1167). Green CI does NOT prove the deploy landed:
-  # Vercel builds independently of this workflow and, on a failed build, keeps
-  # the PREVIOUS deployment live — so a plain reachability curl answers 200 off
-  # the stale deploy and can't tell success from failure. `vite-plugin-version-
-  # stamp` writes `/version.json` carrying the built commit SHA, so we poll it
-  # until the DEPLOYED commit matches the pushed commit. Only then does
-  # notify-deploy (which needs this job) fire; a mismatch/timeout fails this job
-  # and routes to notify-failure instead of a falsely-green "Deployed" message.
-  # Deliberately does NOT depend on ratchet-baseline: that job pushes a
-  # `[skip ci]` coverage-bookkeeping commit to master, and while Vercel skips
-  # deploying it (its `ignoreCommand` ignores commits that touch only
-  # .coverage-baseline.json), gating on it would needlessly couple deploy
-  # verification to coverage bookkeeping and open a SHA-race window. We verify
-  # the deploy of THIS push's commit; migrate-db is the last real deploy
-  # prerequisite (schema must be live before the new code serves).
-  smoke-test-production:
+  # Deploy production from CI, after the schema is live (LIFT-1169).
+  #
+  # Vercel's git integration deployed every master push the moment it landed —
+  # independently of this workflow, and minutes ahead of `migrate-db`, which
+  # waits behind the whole build-and-test + e2e graph. So new code depending on
+  # a column that did not exist yet served errors to users until the migration
+  # caught up, and there was no ordering primitive anywhere that could prevent
+  # it. `vercel.json` now sets `git.deploymentEnabled.master = false`, making
+  # this job the only path to production and turning that ordering into a
+  # `needs:` edge the scheduler enforces.
+  #
+  # The two halves are load-bearing together: with git auto-deploy off and this
+  # job missing (or its secrets unset), master silently stops reaching
+  # production. `deployVerification.test.ts` pins both sides so neither can be
+  # removed alone, and the credential preflight below fails with an actionable
+  # message instead of a Vercel CLI stack trace. A `needs: migrate-db` failure
+  # now blocks the deploy rather than merely mis-reporting one that already
+  # happened — the schema-ahead-of-code direction is the safe one to stall in.
+  #
+  # Preview deploys are untouched: `deploymentEnabled` disables master only, so
+  # PR branches still build through the git integration as before.
+  deploy-production:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     needs: [build-and-test, e2e, migrate-db]
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+    outputs:
+      # 'true' when this commit was actually deployed; 'false' when the
+      # ignoreCommand gate below skipped it. smoke-test-production reads this
+      # rather than re-deriving the same fact.
+      deployed: ${{ steps.deploy_gate.outputs.deploy }}
+    env:
+      # The Vercel CLI reads all three from the environment. ORG/PROJECT ids
+      # stand in for the gitignored .vercel/project.json a local `vercel link`
+      # would write.
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -739,32 +763,56 @@ jobs:
           # HEAD^ is needed to evaluate vercel.json's ignoreCommand below.
           fetch-depth: 2
 
+      # Fail loudly and specifically. Without this, a missing secret surfaces as
+      # a Vercel CLI auth error in a job nobody has read before, on the one push
+      # where production stopped updating.
+      #
+      # Deliberately ahead of the deploy gate: "production cannot be deployed"
+      # is broken whether or not THIS commit was going to deploy, so a docs-only
+      # push should surface it rather than pass green and leave the discovery to
+      # the next real change.
+      - name: Verify deploy credentials are configured
+        run: |
+          set -euo pipefail
+          MISSING=''
+          # `:-` because `set -u` would otherwise abort with "unbound variable"
+          # — a preflight that crashes instead of explaining itself is worse
+          # than no preflight at all.
+          [ -n "${VERCEL_TOKEN:-}" ] || MISSING="$MISSING VERCEL_TOKEN"
+          [ -n "${VERCEL_ORG_ID:-}" ] || MISSING="$MISSING VERCEL_ORG_ID"
+          [ -n "${VERCEL_PROJECT_ID:-}" ] || MISSING="$MISSING VERCEL_PROJECT_ID"
+          if [ -n "$MISSING" ]; then
+            echo "::error::Missing repository secret(s):$MISSING — production is deployed from CI now (vercel.json turns off git auto-deploy for master), so master will not reach production until these are set. VERCEL_ORG_ID and VERCEL_PROJECT_ID are the orgId/projectId in .vercel/project.json after 'vercel link'; create a token at https://vercel.com/account/tokens."
+            exit 1
+          fi
+          echo "Vercel deploy credentials present."
+
       # Vercel does not deploy every commit. vercel.json's `ignoreCommand`
       # skips any commit that touches none of the deployable paths, so a
-      # CI-only, docs-only, or scripts-only push to master never produces a new
-      # deployment — and this job, which waits for production to report the
-      # pushed SHA, would then spin for 300s and fail on a commit that was
-      # never supposed to deploy.
+      # CI-only, docs-only, or scripts-only push to master produces no new
+      # deployment. That gate used to be applied by Vercel; now that CI owns the
+      # deploy, CI has to apply it, or every README tweak would burn a full
+      # production build.
       #
-      # That is not hypothetical: it is how master went red on 2026-08-31.
-      # #1281 changed only .github/ and scripts/, Vercel correctly skipped it,
-      # and this job failed waiting for a deploy that would never come. It went
-      # unnoticed for months only because migrate-db was failing upstream, so
-      # this job had been `skipped` since roughly May and never got to expose
-      # the flaw.
+      # It also still guards smoke-test-production, which waits for production
+      # to report the pushed SHA and would otherwise spin for 300s on a commit
+      # that was never meant to deploy. That is not hypothetical: it is how
+      # master went red on 2026-08-31 — #1281 changed only .github/ and
+      # scripts/, Vercel correctly skipped it, and the verification job failed
+      # waiting for a deploy that would never come.
       #
       # The ignoreCommand is EXECUTED from vercel.json rather than restated
-      # here. Restating it would create a second derivation of one fact, and
-      # the two would drift the first time the deployable path list changes —
-      # the failure mode called out for cleanup.sh/pr-close-reconcile.sh.
-      - name: Skip verification when Vercel skips the deploy
+      # here. Restating it would create a second derivation of one fact, and the
+      # two would drift the first time the deployable path list changes — the
+      # failure mode called out for cleanup.sh/pr-close-reconcile.sh.
+      - name: Decide whether this commit deploys
         id: deploy_gate
         run: |
           set -euo pipefail
           IGNORE_CMD=$(jq -r '.ignoreCommand // empty' vercel.json)
           if [ -z "$IGNORE_CMD" ]; then
-            echo "no ignoreCommand in vercel.json — every commit deploys; verifying."
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "no ignoreCommand in vercel.json — every commit deploys."
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Only ever run the known-safe form. vercel.json is committed and
@@ -775,18 +823,92 @@ jobs:
           esac
           # Vercel's contract: exit 0 from ignoreCommand => SKIP the build.
           if bash -c "$IGNORE_CMD"; then
-            echo "This commit touches no deployable path, so Vercel skipped it."
-            echo "Nothing new will be served; skipping production verification."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "This commit touches no deployable path; skipping the production deploy."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
           else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        if: steps.deploy_gate.outputs.deploy == 'true'
+        with:
+          node-version: 24
+          cache: npm
+
+      # Floating, like supabase/setup-cli's `version: latest` above: pinning a
+      # CLI version here would mean inventing one, and a stale pin silently
+      # diverges from the builder Vercel itself runs.
+      - name: Install Vercel CLI
+        if: steps.deploy_gate.outputs.deploy == 'true'
+        run: npm install -g vercel@latest
+
+      - name: Pull production environment
+        if: steps.deploy_gate.outputs.deploy == 'true'
+        run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+
+      # LIFT_BUILD_COMMIT is what vite-plugin-version-stamp writes into
+      # version.json, and it outranks the ambient VERCEL_GIT_COMMIT_SHA that
+      # `vercel pull` may have written into .vercel/.env.production.local
+      # describing some other deployment. smoke-test-production polls for
+      # exactly this value, so it has to be the commit CI checked out.
+      - name: Build with production environment
+        if: steps.deploy_gate.outputs.deploy == 'true'
+        env:
+          LIFT_BUILD_COMMIT: ${{ github.sha }}
+        run: vercel build --prod --token="$VERCEL_TOKEN"
+
+      # Re-run the LIFT-1123 guard against the bundle that actually ships. The
+      # build-and-test copy runs without Vercel's project env, so it could never
+      # have caught the one cause its own comment names: a VITE_E2E left set on
+      # the Vercel project. This build has that env, so now it can. Scans
+      # `.vercel/output/static` — the tree `deploy --prebuilt` uploads — rather
+      # than assuming `vercel build` leaves `dist/` behind.
+      - name: Guard against dev sign-in in the deployed bundle
+        if: steps.deploy_gate.outputs.deploy == 'true'
+        run: node scripts/check-no-dev-signin.js .vercel/output/static
+
+      - name: Deploy prebuilt output to production
+        if: steps.deploy_gate.outputs.deploy == 'true'
+        run: vercel deploy --prebuilt --prod --yes --token="$VERCEL_TOKEN"
+
+  # Verify production really is serving this commit BEFORE claiming a
+  # successful deploy (LIFT-1167). A green `deploy-production` job does NOT
+  # prove it landed: the CLI can report an upload while the alias still answers
+  # off the previous deployment, and before LIFT-1169 Vercel built master
+  # independently of this workflow and kept the PREVIOUS deploy live on a build
+  # failure — either way a plain reachability curl answers 200 off stale bytes
+  # and can't tell success from failure. `vite-plugin-version-stamp` writes
+  # `/version.json` carrying the built commit SHA, so we poll it until the
+  # DEPLOYED commit matches the pushed commit. Only then does notify-deploy
+  # (which needs this job) fire; a mismatch/timeout fails this job and routes to
+  # notify-failure instead of a falsely-green "Deployed" message.
+  #
+  # Deliberately does NOT depend on ratchet-baseline: that job pushes a
+  # `[skip ci]` coverage-bookkeeping commit to master, and while nothing deploys
+  # it (the ignoreCommand gate skips commits touching only
+  # .coverage-baseline.json), gating on it would needlessly couple deploy
+  # verification to coverage bookkeeping and open a SHA-race window.
+  smoke-test-production:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build-and-test, e2e, migrate-db, deploy-production]
+    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # The production domain is read from CLAUDE.md, the single authoritative
       # source (the SEV1 rule: never hardcode/fabricate a deployment URL — a
       # hallucinated domain shipped to prod once already, see the SEV1 note).
+      #
+      # Skipped when deploy-production skipped the deploy (a CI-only, docs-only
+      # or scripts-only commit): production will keep serving the previous SHA,
+      # so polling for this one would spin for 300s and fail on a commit that
+      # was never meant to deploy. That answer is taken from the deploy job's
+      # own gate output rather than re-derived here — one derivation, one truth.
       - name: Verify production is serving this commit
-        if: steps.deploy_gate.outputs.skip != 'true'
+        if: needs.deploy-production.outputs.deployed == 'true'
         env:
           EXPECTED_SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
@@ -808,9 +930,24 @@ jobs:
             BODY=$(curl -fsS --max-time 15 "$URL/version.json?ci=$RUN_ID-$i" || true)
             DEPLOYED_SHA=$(printf '%s' "$BODY" | jq -r '.commit // empty' 2>/dev/null || true)
             if [ -n "$DEPLOYED_SHA" ] && [ "$DEPLOYED_SHA" = "$EXPECTED_SHA" ]; then
+              # -D - dumps the response headers; the body goes to /dev/null and
+              # is fetched separately below, so the header check can never be
+              # satisfied by markup that merely mentions the policy.
+              HEADERS=$(curl -fsS -D - -o /dev/null --max-time 15 "$URL/?ci=$RUN_ID-h" || true)
               HTML=$(curl -fsS --max-time 15 "$URL/?ci=$RUN_ID" || true)
               if printf '%s' "$HTML" | grep -q '<div id="app">'; then
-                echo "Production is serving commit $EXPECTED_SHA and the app shell renders (attempt $i)."
+                # vercel.json's headers reach production by being compiled into
+                # the deployment's routing config, and LIFT-1169 moved the build
+                # that does that compiling into CI. Nothing else checks they
+                # actually serve — vercelHeadersRegression.test.ts only reads the
+                # source file — so a mechanism change that silently dropped the
+                # CSP would ship green. Verified once, at the end state, rather
+                # than by asserting a shape of Vercel's intermediate artifacts.
+                if ! printf '%s' "$HEADERS" | grep -qi '^content-security-policy:'; then
+                  echo "::error::Production is serving commit $EXPECTED_SHA but sent no Content-Security-Policy header — vercel.json's headers did not reach the deployment"
+                  exit 1
+                fi
+                echo "Production is serving commit $EXPECTED_SHA, the app shell renders, and the security headers are present (attempt $i)."
                 exit 0
               fi
               echo "::warning::version.json matched but the app-shell marker is missing; retrying"
@@ -832,7 +969,7 @@ jobs:
   notify-deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [lint, typecheck, test, build-and-test, e2e, migrate-db, ratchet-baseline, smoke-test-production]
+    needs: [lint, typecheck, test, build-and-test, e2e, migrate-db, deploy-production, ratchet-baseline, smoke-test-production]
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
       - name: Notify Slack
@@ -848,13 +985,16 @@ jobs:
 
   # Notify Slack on post-merge failure (push to master only). Same
   # script-injection guard as `notify-deploy` above. Includes
-  # smoke-test-production so a failed/stalled Vercel deploy (green CI but the
-  # prod URL never serves this commit) surfaces as a failure notification
-  # instead of silently withholding any message.
+  # deploy-production and smoke-test-production so a failed deploy — or one
+  # that succeeded but never served this commit — surfaces as a failure
+  # notification instead of silently withholding any message. Since LIFT-1169
+  # this is also the alarm for "production stopped updating": with git
+  # auto-deploy off, a broken deploy-production job is the only thing standing
+  # between master and users.
   notify-failure:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [lint, typecheck, test, build-and-test, e2e, migrate-db, ratchet-baseline, smoke-test-production]
+    needs: [lint, typecheck, test, build-and-test, e2e, migrate-db, deploy-production, ratchet-baseline, smoke-test-production]
     if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
       - name: Notify Slack
