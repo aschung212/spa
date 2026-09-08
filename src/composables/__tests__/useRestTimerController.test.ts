@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
+import { effectScope, nextTick } from 'vue'
 import { getLocalStorageMock } from '../../__tests__/helpers'
 
 // ── useNotification is mocked so we can observe the notify / background-tracker
@@ -11,14 +12,6 @@ const notifMocks = vi.hoisted(() => ({
   stopTracking: vi.fn(),
   wasBackgrounded: { value: false },
 }))
-
-// The controller registers a service-worker "message" listener and pairs it with
-// an unconditional onUnmounted cleanup (LIFT-751). Stub onUnmounted so the bare
-// (non-component) makeController calls in this suite don't warn — mirrors useModal.test.ts.
-vi.mock('vue', async () => {
-  const actual = await vi.importActual('vue')
-  return { ...(actual as object), onUnmounted: vi.fn() }
-})
 
 vi.mock('../useNotification', () => ({
   REST_TIMER_NOTIFICATION_ACTIONS: [
@@ -38,6 +31,7 @@ vi.mock('../useNotification', () => ({
 
 const { useRestTimerController, formatDuration } = await import('../useRestTimerController')
 const { usePreferencesStore } = await import('../../stores/preferences')
+const { requestRestAgain, restAgainPending, _resetRestTimerIntent } = await import('../../lib/restTimerIntent')
 
 const localStorageMock = getLocalStorageMock()
 
@@ -66,6 +60,15 @@ function stubAudioContext() {
 
 type Controller = ReturnType<typeof useRestTimerController>
 
+// A controller's watchers die with WorkoutTracker, the component that owns it.
+// Bare calls here would leak them across tests — and since the "rest again"
+// intent is module state consumed by exactly one watcher, a stale controller
+// from an earlier test would swallow it before the one under test ever sees it.
+// Own each controller in an effectScope and stop them between tests so the
+// harness matches the component lifetime (the same reason WorkoutTracker.test.ts
+// calls enableAutoUnmount).
+let controllerScopes: ReturnType<typeof effectScope>[] = []
+
 function makeController(): {
   ctrl: Controller
   onComplete: ReturnType<typeof vi.fn>
@@ -73,7 +76,9 @@ function makeController(): {
 } {
   const onComplete = vi.fn()
   const showUndo = vi.fn()
-  const ctrl = useRestTimerController(onComplete, showUndo)
+  const scope = effectScope()
+  controllerScopes.push(scope)
+  const ctrl = scope.run(() => useRestTimerController(onComplete, showUndo)) as Controller
   return { ctrl, onComplete, showUndo }
 }
 
@@ -88,6 +93,11 @@ describe('useRestTimerController', () => {
     notifMocks.startTracking.mockClear()
     notifMocks.stopTracking.mockClear()
     notifMocks.wasBackgrounded.value = false
+  })
+
+  afterEach(() => {
+    controllerScopes.forEach((s) => s.stop())
+    controllerScopes = []
   })
 
   describe('formatDuration', () => {
@@ -559,69 +569,79 @@ describe('useRestTimerController', () => {
     })
   })
 
-  describe('service-worker "rest-again" action (LIFT-751)', () => {
-    let swListeners: Array<(event: MessageEvent) => void>
-    let originalSW: PropertyDescriptor | undefined
-
+  // The controller no longer owns a service-worker listener (LIFT-1355): the
+  // "Rest Again" intent arrives at the app shell — by postMessage while running,
+  // or in the launch URL after a cold boot — and lands in `restTimerIntent`. The
+  // controller's job is to consume it, whether it was recorded before this
+  // instance existed or arrives while it is mounted.
+  describe('pending "rest-again" intent (LIFT-751 / LIFT-1355)', () => {
     beforeEach(() => {
       vi.useFakeTimers({ shouldAdvanceTime: false })
-      swListeners = []
-      originalSW = Object.getOwnPropertyDescriptor(navigator, 'serviceWorker')
-      Object.defineProperty(navigator, 'serviceWorker', {
-        value: {
-          addEventListener: (_type: string, cb: (event: MessageEvent) => void) => swListeners.push(cb),
-          removeEventListener: vi.fn(),
-        },
-        configurable: true,
-      })
+      _resetRestTimerIntent()
     })
 
     afterEach(() => {
       vi.useRealTimers()
-      if (originalSW) {
-        Object.defineProperty(navigator, 'serviceWorker', originalSW)
-      } else {
-        // @ts-expect-error clean up the stub
-        delete navigator.serviceWorker
-      }
+      _resetRestTimerIntent()
     })
 
-    it('restarts a fresh rest timer when the service worker posts rest-again', () => {
+    it('starts a fresh rest for an intent recorded before it was created', async () => {
+      // The cold-boot case: App.vue captures the launch URL, then WorkoutTracker
+      // (an async component) mounts and builds the controller some time later.
+      requestRestAgain()
+
+      const { ctrl } = makeController()
+      await nextTick()
+
+      expect(ctrl.timerActive.value).toBe(true)
+      expect(ctrl.timerSeconds.value).toBe(ctrl.restDuration.value)
+    })
+
+    it('starts a fresh rest for an intent arriving while it is mounted', async () => {
       const { ctrl } = makeController()
       ctrl.restDuration.value = 120
       expect(ctrl.timerActive.value).toBe(false)
-      expect(swListeners.length).toBeGreaterThan(0)
 
-      swListeners.forEach((cb) =>
-        cb({ data: { type: 'rest-timer-action', action: 'rest-again' } } as MessageEvent),
-      )
+      requestRestAgain()
+      await nextTick()
 
       expect(ctrl.timerActive.value).toBe(true)
       expect(ctrl.timerSeconds.value).toBe(120)
     })
 
-    it('ignores unrelated service-worker messages', () => {
+    it('does nothing until an intent actually arrives', async () => {
       const { ctrl } = makeController()
-
-      swListeners.forEach((cb) => {
-        cb({ data: { type: 'other-thing' } } as MessageEvent)
-        cb({ data: { type: 'rest-timer-action', action: 'something-else' } } as MessageEvent)
-        cb({ data: null } as MessageEvent)
-      })
+      await nextTick()
 
       expect(ctrl.timerActive.value).toBe(false)
     })
 
-    it('does not restart when the rest timer has been disabled', () => {
+    it('does not restart when the rest timer has been disabled', async () => {
       const prefs = usePreferencesStore()
       prefs.setRestTimer(false)
-      const { ctrl } = makeController()
+      requestRestAgain()
 
-      swListeners.forEach((cb) =>
-        cb({ data: { type: 'rest-timer-action', action: 'rest-again' } } as MessageEvent),
-      )
+      const { ctrl } = makeController()
+      await nextTick()
 
       expect(ctrl.timerActive.value).toBe(false)
+      // Still consumed — a request the controller declined must not survive to
+      // fire on the next mount.
+      expect(restAgainPending.value).toBe(false)
+    })
+
+    it('consumes the intent so a remount does not restart the timer', async () => {
+      requestRestAgain()
+
+      const first = makeController()
+      await nextTick()
+      expect(first.ctrl.timerActive.value).toBe(true)
+      expect(restAgainPending.value).toBe(false)
+
+      // WorkoutTracker unmounts and remounts (a tab switch away and back).
+      const second = makeController()
+      await nextTick()
+      expect(second.ctrl.timerActive.value).toBe(false)
     })
   })
 })
