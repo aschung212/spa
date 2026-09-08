@@ -648,41 +648,89 @@ describe('useAuth', () => {
       expect(user.value).not.toBeNull()
     })
 
+    // The IDB doubles below hand back a REQUEST object rather than `undefined`,
+    // because `deleteDatabase` returning a request nobody observed is the whole
+    // of LIFT-1356: a delete blocked by a second open tab was indistinguishable
+    // from one that completed. A fake that cannot express "pending" would let
+    // that regress again — the same fake-fidelity rule as `createFakeSupabase`'s
+    // max_rows cap. `pendingDeletes` collects the settle functions so a test can
+    // choose WHEN each request resolves.
+    function stubIndexedDB(options: {
+      databases?: () => Promise<{ name?: string }[]>
+      autoSucceed?: boolean
+    } = {}) {
+      const pendingDeletes: Array<() => void> = []
+      const deleteDatabase = vi.fn((_name: string) => {
+        const request: Record<string, unknown> = {}
+        const succeed = () => (request.onsuccess as (() => void) | undefined)?.()
+        if (options.autoSucceed === false) pendingDeletes.push(succeed)
+        else queueMicrotask(succeed)
+        return request
+      })
+      vi.stubGlobal('indexedDB', {
+        databases: options.databases ?? (() => Promise.resolve([{ name: 'lift-backup' }])),
+        deleteDatabase,
+      })
+      return { deleteDatabase, pendingDeletes }
+    }
+
     it('deletes all IndexedDB databases via indexedDB.databases() when available', async () => {
-      const mockDeleteDatabase = vi.fn()
       const mockDatabases = vi.fn().mockResolvedValue([
         { name: 'lift-backup' },
         { name: 'other-db' },
       ])
-      vi.stubGlobal('indexedDB', {
-        databases: mockDatabases,
-        deleteDatabase: mockDeleteDatabase,
-      })
+      const { deleteDatabase } = stubIndexedDB({ databases: mockDatabases })
 
       const { deleteAccount, devSignIn } = useAuth()
       await devSignIn()
       await deleteAccount()
 
       expect(mockDatabases).toHaveBeenCalled()
-      expect(mockDeleteDatabase).toHaveBeenCalledWith('lift-backup')
-      expect(mockDeleteDatabase).toHaveBeenCalledWith('other-db')
+      expect(deleteDatabase).toHaveBeenCalledWith('lift-backup')
+      expect(deleteDatabase).toHaveBeenCalledWith('other-db')
 
       // Restore indexedDB to default (undefined in test env)
       vi.stubGlobal('indexedDB', undefined)
     })
 
     it('falls back to deleting lift-backup when indexedDB.databases() is not supported', async () => {
-      const mockDeleteDatabase = vi.fn()
-      vi.stubGlobal('indexedDB', {
-        databases: vi.fn().mockRejectedValue(new Error('not supported')),
-        deleteDatabase: mockDeleteDatabase,
+      const { deleteDatabase } = stubIndexedDB({
+        databases: () => Promise.reject(new Error('not supported')),
       })
 
       const { deleteAccount, devSignIn } = useAuth()
       await devSignIn()
       await deleteAccount()
 
-      expect(mockDeleteDatabase).toHaveBeenCalledWith('lift-backup')
+      expect(deleteDatabase).toHaveBeenCalledWith('lift-backup')
+
+      vi.stubGlobal('indexedDB', undefined)
+    })
+
+    // ── Regression LIFT-1356: the local wipe must be OBSERVED, not just fired ─
+    //
+    // deleteAccount used to call `indexedDB.deleteDatabase(...)` and return
+    // without touching the request it hands back. So a delete still blocked by
+    // a second open Lift tab looked exactly like a completed one, and the
+    // previous user's workout backup — plus the durable sync journal — stayed
+    // on disk on a shared device after they were told the account was deleted.
+    it('waits for the IndexedDB wipe instead of firing the request and moving on', async () => {
+      const { deleteDatabase, pendingDeletes } = stubIndexedDB({ autoSucceed: false })
+
+      const { deleteAccount, devSignIn } = useAuth()
+      await devSignIn()
+
+      let settled = false
+      const deletion = deleteAccount().then(() => { settled = true })
+
+      await vi.waitFor(() => expect(deleteDatabase).toHaveBeenCalledWith('lift-backup'))
+      // Give the rest of deleteAccount every chance to run to completion.
+      for (let i = 0; i < 10; i++) await Promise.resolve()
+      expect(settled).toBe(false)
+
+      pendingDeletes.forEach(succeed => succeed())
+      await deletion
+      expect(settled).toBe(true)
 
       vi.stubGlobal('indexedDB', undefined)
     })
