@@ -732,6 +732,11 @@ jobs:
     timeout-minutes: 10
     needs: [build-and-test, e2e, migrate-db]
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+    # Published so notify-deploy can tell "verified live" from "nothing was
+    # deployed" (LIFT-1354). Without it this job succeeds either way and Slack
+    # claimed a verified deploy for commits Vercel never built.
+    outputs:
+      deploy-skipped: ${{ steps.deploy_gate.outputs.skip }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -740,11 +745,16 @@ jobs:
           fetch-depth: 2
 
       # Vercel does not deploy every commit. vercel.json's `ignoreCommand`
-      # skips any commit that touches none of the deployable paths, so a
-      # CI-only, docs-only, or scripts-only push to master never produces a new
+      # skips any commit that touches ONLY non-deployable paths, so a CI-only,
+      # docs-only, or scripts-only push to master never produces a new
       # deployment — and this job, which waits for production to report the
       # pushed SHA, would then spin for 300s and fail on a commit that was
       # never supposed to deploy.
+      #
+      # That list is a denylist, not an allowlist, since LIFT-1354: an
+      # allowlist silently withheld the deploy for anything it forgot to name
+      # (it named vite.config.js but none of the build plugins that config
+      # imports), whereas a denylist deploys an unrecognised path by default.
       #
       # That is not hypothetical: it is how master went red on 2026-08-31.
       # #1281 changed only .github/ and scripts/, Vercel correctly skipped it,
@@ -823,6 +833,17 @@ jobs:
           exit 1
 
   # Notify Slack on post-merge success (push to master only).
+  #
+  # The message BRANCHES on whether a deploy actually happened (LIFT-1354).
+  # smoke-test-production skips its verification for a commit Vercel ignores —
+  # correctly, since polling for a SHA production will never report would spin
+  # 300s and fail — but the job still succeeds, so this step used to post
+  # "Deployed to production (verified live)" for a commit that was neither
+  # deployed nor verified. That is the same falsely-green claim LIFT-1167
+  # exists to eliminate, entering through the skip path rather than the
+  # failed-build path. Reporting nothing instead would be worse: silence is
+  # indistinguishable from a broken workflow.
+  #
   # SECURITY: commit message + URL come in via env var, NOT direct
   # `${{ ... }}` interpolation into the bash body. Inline interpolation
   # is a known GitHub Actions script-injection vector — any commit
@@ -840,9 +861,14 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           COMMIT_MSG_RAW: ${{ github.event.head_commit.message }}
           COMMIT_URL: ${{ github.event.head_commit.url }}
+          DEPLOY_SKIPPED: ${{ needs.smoke-test-production.outputs.deploy-skipped }}
         run: |
           COMMIT_MSG=$(printf '%s' "$COMMIT_MSG_RAW" | head -1)
-          MSG="✅ *Deployed to production* (verified live)\nCommit: <${COMMIT_URL}|${COMMIT_MSG}>"
+          if [ "$DEPLOY_SKIPPED" = "true" ]; then
+            MSG="⏭️ *CI passed — no production deploy* (this commit touches no deployable path, so production still serves the previous commit)\nCommit: <${COMMIT_URL}|${COMMIT_MSG}>"
+          else
+            MSG="✅ *Deployed to production* (verified live)\nCommit: <${COMMIT_URL}|${COMMIT_MSG}>"
+          fi
           payload=$(printf '{"text": %s}' "$(printf '%s' "$MSG" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')")
           curl -s -X POST "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' -d "$payload"
 
