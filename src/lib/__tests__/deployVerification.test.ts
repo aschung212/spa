@@ -248,4 +248,26 @@ describe('production deploys are ordered after the schema migration (LIFT-1169)'
     // the policy must not be able to satisfy the check.
     expect(run).toContain('-D -')
   })
+
+  it('retries an empty header probe instead of calling it a dropped CSP', () => {
+    // The probe curl ends in `|| true`, so a transient fetch failure and a
+    // genuinely absent header both arrive as an empty string. Conflating them
+    // fails the deploy — terminally, inside a 30-attempt loop that exists to
+    // absorb exactly this — and blames a vercel.json regression that never
+    // happened, on the one job whose purpose is to report accurately WHICH
+    // system broke. The empty case must warn and retry, like the app-shell
+    // marker check beside it; only a probe that came back and lacks the header
+    // is a real failure.
+    const verify = (jobs['smoke-test-production']?.steps ?? []).find((s) =>
+      /version|verify/i.test(s.name ?? ''),
+    )
+    const run = verify?.run ?? ''
+    const emptyProbeGuard = run.indexOf('[ -z "$HEADERS" ]')
+    expect(
+      emptyProbeGuard,
+      'expected an empty-probe branch before the CSP failure',
+    ).toBeGreaterThan(-1)
+    // …and it has to come FIRST, or the failure branch claims the empty probe.
+    expect(emptyProbeGuard).toBeLessThan(run.indexOf('no Content-Security-Policy header'))
+  })
 })

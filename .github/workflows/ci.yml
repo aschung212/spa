@@ -943,14 +943,27 @@ jobs:
                 # source file — so a mechanism change that silently dropped the
                 # CSP would ship green. Verified once, at the end state, rather
                 # than by asserting a shape of Vercel's intermediate artifacts.
-                if ! printf '%s' "$HEADERS" | grep -qi '^content-security-policy:'; then
+                #
+                # An EMPTY probe means the curl above fell over, not that the
+                # header is gone — its `|| true` swallows that difference. So it
+                # retries like the app-shell marker does, rather than failing:
+                # reporting "vercel.json's headers did not reach the deployment"
+                # for a dropped request would name a config regression that
+                # never happened, on the one job whose whole purpose is to say
+                # accurately what broke, and would do it terminally inside a
+                # loop built to absorb exactly this blip.
+                if [ -z "$HEADERS" ]; then
+                  echo "::warning::version.json matched but the header probe came back empty; retrying"
+                elif ! printf '%s' "$HEADERS" | grep -qi '^content-security-policy:'; then
                   echo "::error::Production is serving commit $EXPECTED_SHA but sent no Content-Security-Policy header — vercel.json's headers did not reach the deployment"
                   exit 1
+                else
+                  echo "Production is serving commit $EXPECTED_SHA, the app shell renders, and the security headers are present (attempt $i)."
+                  exit 0
                 fi
-                echo "Production is serving commit $EXPECTED_SHA, the app shell renders, and the security headers are present (attempt $i)."
-                exit 0
+              else
+                echo "::warning::version.json matched but the app-shell marker is missing; retrying"
               fi
-              echo "::warning::version.json matched but the app-shell marker is missing; retrying"
             else
               echo "Attempt $i/$ATTEMPTS: deployed=${DEPLOYED_SHA:-<none>} expected=$EXPECTED_SHA — waiting ${SLEEP}s"
             fi
