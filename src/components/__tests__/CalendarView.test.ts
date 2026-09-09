@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import { getLocalStorageMock, mockAnalytics, mockWeightUnit } from '../../__tests__/helpers'
+import { bodyweightFold } from '../../lib/bodyweightLoad'
+import { epley } from '../../lib/epley'
 
 const localStorageMock = getLocalStorageMock()
 
@@ -26,7 +28,12 @@ interface MockExercise {
   name: string
   tags: string[]
   sets: MockSet[]
+  bodyweightLoaded?: boolean
 }
+
+// The lifter's tracked bodyweight, as the real store's `_currentBodyweight()`
+// would read it (LIFT-834).
+let bodyweightLbs: number | null = null
 
 let exercises: MockExercise[] = []
 
@@ -42,13 +49,23 @@ function getAllTags(): string[] {
   return [...tags].sort()
 }
 
+const mockLogSet = vi.fn()
+
+// Delegates to the REAL fold helper so the mock can't invent its own rule about
+// when bodyweight counts — the same fidelity contract the WorkoutTracker
+// harness holds itself to (#1328).
+function bodyweightFoldFor(id: string): number {
+  return bodyweightFold(exercises.find(e => e.id === id), bodyweightLbs)
+}
+
 vi.mock('../../stores/workout', () => ({
   useWorkoutStore: () => ({
     get exercises() { return exercises },
     set exercises(v: MockExercise[]) { exercises = v },
     get allTags() { return getAllTags() },
     getExercisePR,
-    logSet: vi.fn(),
+    bodyweightFoldFor,
+    logSet: mockLogSet,
     addExercise: vi.fn(),
     tagRecoveryDays: {},
     tagRecoveryExcluded: [],
@@ -84,6 +101,8 @@ function makeExercises(dates: string[]): MockExercise[] {
 describe('CalendarView', () => {
   beforeEach(() => {
     exercises = []
+    bodyweightLbs = null
+    mockLogSet.mockClear()
     localStorageMock.clear()
   })
 
@@ -700,6 +719,77 @@ describe('CalendarView', () => {
 
       await wrapper.findAll('.calToggleBtn')[0].trigger('click')
       expect(wrapper.find('.wtTagFilterBar').exists()).toBe(false)
+    })
+  })
+
+  /**
+   * The calendar's "+ Log" is the app's SECOND way to log a set — backfilling a
+   * day you forgot — and it carried its own hand-rolled copy of the log sheet's
+   * `weight > 0` gate, so fixing only the sheet would have left the pure
+   * bodyweight set (LIFT-1330) refused here. Its estimate was also still
+   * unfolded, the #1328 defect surviving in a surface that issue never touched:
+   * a bodyweight-loaded pull-up read ~29 lbs on screen while `logSet` was about
+   * to store ~216.
+   */
+  describe('backfill log modal, bodyweight-loaded (LIFT-1330)', () => {
+    const BODYWEIGHT = 160
+
+    async function openLogModalFor(name: string) {
+      const wrapper = mountCalendar()
+      await wrapper.find('.calCellToday').trigger('click')
+      await wrapper.find('.calLogBtn').trigger('click')
+      await wrapper.findAll('.wtExPickerRow').find(b => b.text().includes(name))!.trigger('click')
+      return wrapper
+    }
+
+    function fields(wrapper: ReturnType<typeof mountCalendar>) {
+      const inputs = wrapper.findAll('[aria-labelledby="cal-modal-title"] input')
+      return { weight: inputs[0], reps: inputs[1] }
+    }
+
+    const saveBtn = (wrapper: ReturnType<typeof mountCalendar>) =>
+      wrapper.find('[aria-labelledby="cal-modal-title"] .repMaxBtnCalc')
+
+    beforeEach(() => {
+      bodyweightLbs = BODYWEIGHT
+      exercises = [{ id: 'ex-1', name: 'Pull-Up', tags: ['Back'], bodyweightLoaded: true, sets: [] }]
+    })
+
+    it('accepts an added weight of 0 and logs it', async () => {
+      const wrapper = await openLogModalFor('Pull-Up')
+      const { weight, reps } = fields(wrapper)
+      await weight.setValue('0')
+      await reps.setValue('12')
+
+      expect(saveBtn(wrapper).attributes('disabled')).toBeUndefined()
+      await saveBtn(wrapper).trigger('click')
+      expect(mockLogSet).toHaveBeenCalledWith('ex-1', 0, 12, expect.any(String))
+    })
+
+    it('estimates the folded load, matching what logSet stores', async () => {
+      const wrapper = await openLogModalFor('Pull-Up')
+      const { weight, reps } = fields(wrapper)
+      await weight.setValue('25')
+      await reps.setValue('5')
+
+      expect(wrapper.find('.repMaxResult').text()).toContain(`${epley(BODYWEIGHT + 25, 5)} lbs`)
+    })
+
+    it('calls the field "Added" and drops the barbell placeholder', async () => {
+      const wrapper = await openLogModalFor('Pull-Up')
+      expect(fields(wrapper).weight.attributes('placeholder')).toBe('0')
+      expect(wrapper.find('[aria-labelledby="cal-modal-title"] .repMaxLabel').text()).toContain('Added')
+    })
+
+    it('still refuses 0 on a normal exercise', async () => {
+      exercises = [{ id: 'ex-2', name: 'Bench Press', tags: ['Chest'], sets: [] }]
+      const wrapper = await openLogModalFor('Bench Press')
+      const { weight, reps } = fields(wrapper)
+      await weight.setValue('0')
+      await reps.setValue('5')
+
+      expect(saveBtn(wrapper).attributes('disabled')).toBeDefined()
+      expect(fields(wrapper).weight.attributes('placeholder')).toBe('135')
     })
   })
 })

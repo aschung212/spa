@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { addedWeightFromEffective, bodyweightFold, effectiveSetWeight } from '../bodyweightLoad'
+import {
+  addedWeightFromEffective,
+  allowsZeroWeight,
+  bodyweightFold,
+  effectiveSetWeight,
+  isLoggableWeight,
+} from '../bodyweightLoad'
 import type { WorkoutSet } from '../../stores/workout'
 
 function set(partial: Partial<WorkoutSet>): WorkoutSet {
@@ -81,5 +87,43 @@ describe('addedWeightFromEffective (#1328)', () => {
     const exercise = { bodyweightLoaded: true }
     const effective = effectiveSetWeight(set({ weight: 25, bodyweight: undefined }), exercise)
     expect(addedWeightFromEffective(effective, exercise, undefined)).toBe(25)
+  })
+})
+
+describe('isLoggableWeight (LIFT-1330)', () => {
+  it('accepts 0 on a bodyweight-loaded exercise', () => {
+    // The set this whole module exists for: a plain pull-up, added nothing.
+    expect(isLoggableWeight(0, { bodyweightLoaded: true })).toBe(true)
+    expect(allowsZeroWeight({ bodyweightLoaded: true })).toBe(true)
+  })
+
+  it('rejects 0 everywhere else', () => {
+    // A 0 lb barbell set carries no information — the floor only moves for the
+    // exercise whose weight field means "added".
+    expect(isLoggableWeight(0, { bodyweightLoaded: false })).toBe(false)
+    expect(isLoggableWeight(0)).toBe(false)
+    expect(isLoggableWeight(0, null)).toBe(false)
+    expect(allowsZeroWeight({ bodyweightLoaded: false })).toBe(false)
+    expect(allowsZeroWeight()).toBe(false)
+  })
+
+  it('keeps an unfilled field distinct from an explicit 0', () => {
+    // null/undefined is "not entered", which is what keeps the to-beat card
+    // alive; only a real number clears the floor.
+    expect(isLoggableWeight(null, { bodyweightLoaded: true })).toBe(false)
+    expect(isLoggableWeight(undefined, { bodyweightLoaded: true })).toBe(false)
+    expect(isLoggableWeight(NaN, { bodyweightLoaded: true })).toBe(false)
+    expect(isLoggableWeight(Infinity, { bodyweightLoaded: true })).toBe(false)
+  })
+
+  it('rejects a negative weight even on a bodyweight-loaded exercise', () => {
+    // `addedWeightFromEffective` can hand back a negative ("bodyweight alone
+    // beats this"), and that is a message, never a set.
+    expect(isLoggableWeight(-5, { bodyweightLoaded: true })).toBe(false)
+  })
+
+  it('passes ordinary positive weights through unchanged', () => {
+    expect(isLoggableWeight(135, { bodyweightLoaded: false })).toBe(true)
+    expect(isLoggableWeight(2.5, { bodyweightLoaded: true })).toBe(true)
   })
 })

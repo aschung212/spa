@@ -287,8 +287,11 @@
         <p class="wtModalSubtitle">{{ formatSelectedDay(logModal.date) }}</p>
 
         <div class="wtInputRow">
+          <!-- "Added" on a bodyweight-loaded exercise, matching the log sheet:
+               the field is the weight on the belt, and 0 is a real value
+               (LIFT-1330). -->
           <label class="repMaxLabel" style="flex:1">
-            Weight ({{ weightUnit }})
+            {{ logModalWeightLabel }} ({{ weightUnit }})
             <div class="repMaxInputRow">
               <input
                 v-model.number="logModal.weight"
@@ -296,7 +299,7 @@
                 inputmode="decimal"
                 min="0"
                 step="any"
-                placeholder="135"
+                :placeholder="logModalWeightPlaceholder"
                 class="repMaxInput"
               />
             </div>
@@ -345,6 +348,8 @@ import { useTagRecovery } from '../composables/useTagRecovery'
 import { useVolumeTrend } from '../composables/useVolumeTrend'
 import { useRepRangeDistribution } from '../composables/useRepRangeDistribution'
 import { useCalendarData } from '../composables/useCalendarData'
+import { allowsZeroWeight, isLoggableWeight } from '../lib/bodyweightLoad'
+import { epley } from '../lib/epley'
 import type { HeatmapDay } from '../components/ConsistencyHeatmap.vue'
 
 const MuscleGroupChart = defineAsyncComponent(() => import('../components/MuscleGroupChart.vue'))
@@ -745,17 +750,44 @@ function closeExercisePicker() {
   closePicker()
 }
 
+/** The exercise this backfill modal is logging for. */
+const logModalExercise = computed(() =>
+  store.exercises.find(e => e.id === logModal.value.exerciseId),
+)
+
+// Same copy rule as the log sheet: the field means ADDED weight on a
+// bodyweight-loaded exercise, and "135" is a barbell's placeholder.
+const logModalWeightLabel = computed(() =>
+  allowsZeroWeight(logModalExercise.value) ? 'Added' : 'Weight',
+)
+const logModalWeightPlaceholder = computed(() =>
+  allowsZeroWeight(logModalExercise.value) ? '0' : '135',
+)
+
+/**
+ * Estimate for the set being backfilled. Runs the same `epley()` over the same
+ * folded load the store will store (LIFT-834 / #1328) — this surface was still
+ * estimating off the bare field, so a bodyweight-loaded pull-up read ~29 lbs
+ * here against the ~216 `logSet` was about to write. Null rather than 0 when
+ * there is no load at all (added 0 with no bodyweight on record): the row is a
+ * readout, and "0 lbs" is not an estimate.
+ */
 const logModalEstimate = computed(() => {
-  const { weight, reps } = logModal.value
-  if (!weight || weight <= 0 || !reps || reps < 1) return null
-  const w = toLbs(weight)
-  const est = reps === 1 ? w : w * (1 + reps / 30)
-  return displayWeight(Math.round(est))
+  const { weight, reps, exerciseId } = logModal.value
+  if (!isLoggableWeight(weight, logModalExercise.value) || !reps || reps < 1) return null
+  const loadLbs = toLbs(weight!) + store.bodyweightFoldFor(exerciseId)
+  if (loadLbs <= 0) return null
+  return displayWeight(epley(loadLbs, reps))
 })
 
+/**
+ * The backfill path's weight floor. Shares `isLoggableWeight` with the log
+ * sheet (LIFT-1330) so the second entry point can't keep refusing the
+ * pure-bodyweight set the first one now accepts.
+ */
 const canSaveLog = computed(() => {
   const { exerciseId, weight, reps } = logModal.value
-  return exerciseId && weight !== null && weight > 0 && reps !== null && reps >= 1
+  return !!exerciseId && isLoggableWeight(weight, logModalExercise.value) && reps !== null && reps >= 1
 })
 
 function saveLog() {

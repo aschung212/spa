@@ -2235,8 +2235,13 @@ describe('WorkoutTracker', () => {
       await wrapper.vm.$nextTick()
     }
 
+    // The field is labelled "Added" on a bodyweight-loaded exercise (LIFT-1330)
+    // — it holds belt weight, not the load. The one test below that mounts a
+    // normal exercise still finds it as "Weight", which is the point.
+    const ADDED_FIELD = 'input[aria-label="Added weight"]'
+
     function weightField(wrapper: VueWrapper) {
-      return wrapper.find('input[aria-label="Weight"]').element as HTMLInputElement
+      return wrapper.find(ADDED_FIELD).element as HTMLInputElement
     }
 
     /** What `logSet` would store for a set typed into the fields right now. */
@@ -2252,7 +2257,7 @@ describe('WorkoutTracker', () => {
     it('estimates the 1RM of the full load, matching what logSet will store', async () => {
       const wrapper = mountTracker()
       await openPullupModal(wrapper)
-      await wrapper.find('input[aria-label="Weight"]').setValue('25')
+      await wrapper.find(ADDED_FIELD).setValue('25')
       await wrapper.find('input[aria-label="Reps"]').setValue('5')
 
       // Was ~29 lbs — Epley over the bare added weight — against a stored 216.
@@ -2286,7 +2291,7 @@ describe('WorkoutTracker', () => {
       // 5 lb step past the 25.6 lb of belt weight actually required.
       expect(card.text()).toContain('30 lbs × 5')
 
-      await wrapper.find('input[aria-label="Weight"]').setValue('30')
+      await wrapper.find(ADDED_FIELD).setValue('30')
       // The savable consequence: this must edge the PR, not land near 2x it.
       const saved = savedE1RM(wrapper, 5)
       expect(saved).toBeGreaterThan(PR)
@@ -2364,7 +2369,7 @@ describe('WorkoutTracker', () => {
       await openPullupModal(wrapper)
       // 25 lb added ties the PR at 5 reps, so 6 reps beats it — not the ~90 the
       // unfolded comparison (25 vs 216) used to demand.
-      await wrapper.find('input[aria-label="Weight"]').setValue('25')
+      await wrapper.find(ADDED_FIELD).setValue('25')
 
       const card = wrapper.find('.repMaxResultTarget')
       expect(card.text()).toContain('25 lbs × 6')
@@ -2380,8 +2385,13 @@ describe('WorkoutTracker', () => {
       const card = wrapper.find('.repMaxResultTarget')
       expect(card.text()).toContain('Bodyweight × 12')
       expect(card.text()).toContain('no added weight needed')
-      // Informational: tapping it must not fill an unsavable 0 into the field.
-      expect(card.classes()).not.toContain('repMaxResultTappable')
+      // #1328 shipped this card informational-only because 0 was not a savable
+      // weight. LIFT-1330 made it one, so the card now loads its own answer
+      // like every other to-beat card in the sheet.
+      expect(card.classes()).toContain('repMaxResultTappable')
+      await card.trigger('click')
+      expect(weightField(wrapper).value).toBe('0')
+      expect(wrapper.find('.repMaxBtnCalc').attributes('disabled')).toBeUndefined()
     })
 
     it('edits against the set\'s captured bodyweight, not today\'s weigh-in', async () => {
@@ -2408,10 +2418,159 @@ describe('WorkoutTracker', () => {
       mockBodyweightState.lbs = null
       const wrapper = mountTracker()
       await openPullupModal(wrapper)
-      await wrapper.find('input[aria-label="Weight"]').setValue('25')
+      await wrapper.find(ADDED_FIELD).setValue('25')
       await wrapper.find('input[aria-label="Reps"]').setValue('5')
 
       expect(wrapper.find('.repMaxResult').text()).toContain(`${epley(25, 5)} lbs`)
+    })
+
+    /**
+     * LIFT-1330 — the entry half of the same feature. LIFT-834 was built so
+     * "a pure-bodyweight rep at added = 0 still scores", and the store scored
+     * it from day one, but every gate in this sheet hand-rolled `weight > 0`:
+     * a plain pull-up — the single most common set the feature exists to
+     * record — could not be typed in. There was no other way in either, so the
+     * lifter's options were to skip the set or to log a fake 1 lb, which then
+     * poisons the ladder clustering and the overload nudge with a rung nobody
+     * loaded.
+     *
+     * Why nothing caught it: the flag's tests all cover the FOLD, never the
+     * ENTRY. `bodyweightLoad.test.ts` builds `{ weight: 0, bodyweight: 170 }`
+     * as a fixture literal and asserts the math; it never asks whether the app
+     * can produce that object. #1328 added the first tests that mount the
+     * tracker with `bodyweightLoaded` set, and every one of them types a
+     * positive added weight — because that is all the sheet accepted.
+     */
+    describe('logging added-0 (LIFT-1330)', () => {
+      const saveBtn = (wrapper: VueWrapper) => wrapper.find('.repMaxBtn.repMaxBtnCalc')
+      const isSaveEnabled = (wrapper: VueWrapper) =>
+        saveBtn(wrapper).attributes('disabled') === undefined
+
+      it('enables Save and logs weight 0 for a pure-bodyweight set', async () => {
+        const wrapper = mountTracker()
+        await openPullupModal(wrapper)
+        await wrapper.find(ADDED_FIELD).setValue('0')
+        await wrapper.find('input[aria-label="Reps"]').setValue('12')
+
+        expect(isSaveEnabled(wrapper)).toBe(true)
+        await saveBtn(wrapper).trigger('click')
+        expect(mockLogSet).toHaveBeenCalledWith(
+          'ex-1', 0, 12, expect.any(String), expect.objectContaining({}),
+        )
+      })
+
+      it('estimates the 1RM of bodyweight alone', async () => {
+        const wrapper = mountTracker()
+        await openPullupModal(wrapper)
+        await wrapper.find(ADDED_FIELD).setValue('0')
+        await wrapper.find('input[aria-label="Reps"]').setValue('12')
+
+        // Epley over the lifter's own bodyweight — the number logSet stores.
+        expect(wrapper.find('.repMaxResult').text()).toContain(`${epley(BODYWEIGHT, 12)} lbs`)
+      })
+
+      it('still refuses 0 on a normal exercise', async () => {
+        mockState.exercises = [{
+          id: 'ex-1', name: 'Bench Press', tags: [], sets: [
+            { id: 's-1', date: '2026-01-15T12:00:00', weight: 185, reps: 5, estimated1RM: 216 },
+          ],
+        }]
+        const wrapper = mountTracker()
+        await openPullupModal(wrapper)
+        await wrapper.find('input[aria-label="Weight"]').setValue('0')
+        await wrapper.find('input[aria-label="Reps"]').setValue('5')
+
+        // A 0 lb barbell set says nothing — the floor only moves for the
+        // exercise whose field means "added".
+        expect(isSaveEnabled(wrapper)).toBe(false)
+      })
+
+      it('keeps an empty field distinct from an explicit 0', async () => {
+        const wrapper = mountTracker()
+        await openPullupModal(wrapper)
+        await wrapper.find('input[aria-label="Reps"]').setValue('12')
+
+        // Reps alone is not a set: blank still means "not filled in", which is
+        // also what keeps the "what should I add?" card on screen.
+        expect(isSaveEnabled(wrapper)).toBe(false)
+        expect(wrapper.find('.repMaxResultTarget').exists()).toBe(true)
+
+        await wrapper.find(ADDED_FIELD).setValue('0')
+        expect(isSaveEnabled(wrapper)).toBe(true)
+        // ...and now the weight axis IS filled, so the card gives way to the
+        // estimate rather than suggesting a weight the lifter just chose.
+        expect(wrapper.find('.repMaxResultTarget').exists()).toBe(false)
+      })
+
+      it('calls the field "Added" and drops the barbell placeholder', async () => {
+        const wrapper = mountTracker()
+        await openPullupModal(wrapper)
+
+        const field = wrapper.find(ADDED_FIELD)
+        expect(field.attributes('placeholder')).toBe('0')
+        // The visible label, not just the accessible one: "Weight: 135" on a
+        // pull-up is why added-0 looked forbidden in the first place.
+        expect(wrapper.find('.logSetFieldWeight .logSetFieldLabel').text()).toContain('Added')
+      })
+
+      it('leaves the label and placeholder alone on a normal exercise', async () => {
+        mockState.exercises = [{ id: 'ex-1', name: 'Bench Press', tags: [], sets: [] }]
+        const wrapper = mountTracker()
+        await openPullupModal(wrapper)
+
+        expect(wrapper.find('input[aria-label="Weight"]').attributes('placeholder')).toBe('135')
+        expect(wrapper.find('.logSetFieldWeight .logSetFieldLabel').text()).toContain('Weight')
+      })
+
+      it('counts pure-bodyweight history as the best at that weight', async () => {
+        mockState.exercises = [{
+          id: 'ex-1', name: 'Pull-Up', tags: ['Back'], bodyweightLoaded: true,
+          sets: [
+            { id: 's-1', date: '2026-01-15T12:00:00', weight: 0, reps: 8, bodyweight: BODYWEIGHT, estimated1RM: epley(BODYWEIGHT, 8) },
+            { id: 's-2', date: '2026-01-20T12:00:00', weight: 0, reps: 10, bodyweight: BODYWEIGHT, estimated1RM: epley(BODYWEIGHT, 10) },
+          ],
+        }]
+        const wrapper = mountTracker()
+        await openPullupModal(wrapper)
+        // Weight only → the reps-to-beat card, which now has an added-0 rung of
+        // history to read rather than bailing on the field.
+        await wrapper.find(ADDED_FIELD).setValue('0')
+
+        const card = wrapper.find('.repMaxResultTarget')
+        expect(card.text()).toContain('Your best at 0 lbs: 10 reps')
+      })
+
+      it('offers no rep target when there is no bodyweight to make 0 a load', async () => {
+        // Added 0 with nothing on record is a genuinely zero load, and
+        // "how many reps at nothing beats your PR" divides by it — the card
+        // would have rendered an Infinity rep count.
+        mockBodyweightState.lbs = null
+        const wrapper = mountTracker()
+        await openPullupModal(wrapper)
+        await wrapper.find(ADDED_FIELD).setValue('0')
+
+        expect(wrapper.find('.repMaxResultTarget').exists()).toBe(false)
+        // Save still works — the set is real, only the estimate is unknowable.
+        await wrapper.find('input[aria-label="Reps"]').setValue('12')
+        expect(isSaveEnabled(wrapper)).toBe(true)
+      })
+
+      it('lets an existing set be edited down to bodyweight only', async () => {
+        const wrapper = mountTracker()
+        await wrapper.findAll('.wtExerciseRow')[0].trigger('click')
+        await wrapper.vm.$nextTick()
+        await wrapper.findAll('.wtSetRowMain')[0].trigger('click')
+        await wrapper.vm.$nextTick()
+        await wrapper.findAll('.wtSetBtn').find(b => b.text() === 'Edit')!.trigger('click')
+        await wrapper.vm.$nextTick()
+
+        await wrapper.find(ADDED_FIELD).setValue('0')
+        expect(isSaveEnabled(wrapper)).toBe(true)
+        await saveBtn(wrapper).trigger('click')
+        expect(mockUpdateSet).toHaveBeenCalledWith(
+          'ex-1', 's-2', 0, 5, expect.any(String), null, false,
+        )
+      })
     })
   })
 
