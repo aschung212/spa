@@ -1936,3 +1936,56 @@ describe('Invariant: every WorkoutSet field is synced or locally preserved (#135
     expect([...preservedFields()].filter(f => mapped.has(f))).toEqual([])
   })
 })
+
+/**
+ * `ExercisePickerModal` owns the "Choose Exercise" sheet. CalendarView shipped a
+ * hand-rolled copy of its markup, and the copy drifted the way copies do: it
+ * listed `store.exercises` raw, so an exercise archived on the Workouts tab
+ * still offered itself here, and it never grew the "+ New exercise" row the
+ * original added — leaving a user with no exercises a modal with an empty body
+ * and only Cancel (LIFT-1375).
+ *
+ * No behavioural test could catch that: a spec for the component only ever
+ * mounts the component, and a spec for the copy asserts the copy's own
+ * behaviour. The guard has to be structural — the picker's row markup may
+ * appear in exactly one file, so a second host is forced through the props and
+ * emits the first one already defines.
+ */
+describe('Invariant: the exercise picker has one implementation (LIFT-1375)', () => {
+  const PICKER = join('components', 'ExercisePickerModal.vue')
+  const ROW_CLASS = 'wtExPickerRow'
+
+  const pickerVueFiles = () => getSourceFiles().filter(f => f.path.endsWith('.vue'))
+
+  it('finds the picker and its row markup (non-vacuity)', () => {
+    const picker = pickerVueFiles().find(f => f.path === PICKER)
+    expect(picker, PICKER + " is the picker's one implementation").toBeDefined()
+    expect(picker!.content).toContain(ROW_CLASS)
+  })
+
+  it('is reached by every host through the component, not a copy', () => {
+    const hosts = pickerVueFiles()
+      .filter(f => f.path !== PICKER && /import\s+ExercisePickerModal\s+from/.test(f.content))
+      .map(f => f.path)
+
+    // Both logging surfaces: the Workouts tab's quick-log picker and the
+    // Calendar tab's backfill picker. If either drops out, the scan below
+    // passes vacuously.
+    expect(hosts).toContain(join('components', 'WorkoutTracker.vue'))
+    expect(hosts).toContain(join('views', 'CalendarView.vue'))
+  })
+
+  it('renders the picker rows in exactly one file', () => {
+    const copies = pickerVueFiles()
+      .filter(f => f.path !== PICKER && stripComments(f.content).includes(ROW_CLASS))
+      .map(f => f.path)
+
+    expect(copies, copies.length === 0 ? '' :
+      copies.join(', ') + ' render .' + ROW_CLASS + ' markup of their own instead ' +
+      'of using ExercisePickerModal. A second copy of this sheet drifts from the ' +
+      "first — the calendar's leaked archived exercises and lost the " +
+      '"+ New exercise" row (LIFT-1375). Import the component, bind `exercises`, ' +
+      'and handle `select` + `create-new` instead.',
+    ).toEqual([])
+  })
+})

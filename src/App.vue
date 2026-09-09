@@ -121,7 +121,7 @@
         >
           <KeepAlive>
             <WorkoutTracker v-if="activeTab === 'workouts'" ref="workoutTrackerRef" />
-            <CalendarView v-else-if="activeTab === 'calendar'" />
+            <CalendarView v-else-if="activeTab === 'calendar'" @create-exercise="addExerciseFromCalendar" />
             <BodyweightTracker v-else-if="activeTab === 'weight'" />
           </KeepAlive>
         </div>
@@ -718,8 +718,37 @@ function triggerAddExercise() {
   const wt = workoutTrackerRef.value
   if (wt && typeof wt.openNewExerciseModal === 'function') {
     wt.openNewExerciseModal()
+    return true
   }
+  return false
 }
+
+/**
+ * "+ New exercise" from the Calendar tab's backfill picker (LIFT-1375). The
+ * calendar deliberately owns no creation form of its own, so the intent is
+ * carried to the one that exists.
+ *
+ * The intent is PARKED rather than fired straight at the ref: the top-bar "+"
+ * can assume WorkoutTracker is mounted (it only renders on that tab), but this
+ * caller cannot — WorkoutTracker is an async component, so on a cold start
+ * straight into `?tab=calendar` its chunk is still loading when the tab flips
+ * and `workoutTrackerRef` is null for more than a tick. The template ref is
+ * reactive, so the watcher below flushes the intent whenever it does land.
+ */
+const pendingAddExercise = ref(false)
+
+function addExerciseFromCalendar() {
+  pendingAddExercise.value = true
+  switchTab('workouts')
+  flushPendingAddExercise()
+}
+
+function flushPendingAddExercise() {
+  if (!pendingAddExercise.value) return
+  if (triggerAddExercise()) pendingAddExercise.value = false
+}
+
+watch(workoutTrackerRef, () => flushPendingAddExercise())
 
 // Flush engagement timing on page unload
 function onBeforeUnload() {
