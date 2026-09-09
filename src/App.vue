@@ -734,6 +734,12 @@ function triggerAddExercise() {
  * straight into `?tab=calendar` its chunk is still loading when the tab flips
  * and `workoutTrackerRef` is null for more than a tick. The template ref is
  * reactive, so the watcher below flushes the intent whenever it does land.
+ *
+ * The switch is unconditional even when the Workouts tab is disabled in
+ * preferences: that user has no exercise-creation surface at all (the top-bar
+ * "+" only renders on that tab), so honouring the tap is the only thing that
+ * helps, and the tab bar still holds their escape route — the same thing the
+ * "Go to Workouts" keyboard shortcut already does.
  */
 const pendingAddExercise = ref(false)
 
