@@ -1832,3 +1832,107 @@ describe('Invariant: every custom role="button" is keyboard-operable (LIFT-1305)
     expect(violations).toEqual([])
   })
 })
+
+// ── Invariant: every WorkoutSet field is synced or preserved (#1357) ─
+//
+// A `WorkoutSet` field is in one of exactly two states, and there is no third:
+// either the `sets` table has a column for it (so `_enqueueSetUpsert` sends it
+// and `mapRemoteSet` reads it back), or it lives on the device only and must be
+// carried across a merge by `LOCAL_ONLY_SET_FIELDS`.
+//
+// `rpe` (#617) and `bodyweight` (LIFT-834) shipped in neither. `mergeEntities`
+// picks an exercise wholesale by last-write-wins, sets and all, and the union
+// after it only adds sets the winner is MISSING — so when the remote row won (a
+// rename on a second device is enough), every set present on both sides was
+// replaced by the server's copy of itself, and the two fields the server cannot
+// carry were gone. Silent, routine, and committed to localStorage, so the next
+// cold start loaded the stripped copy.
+//
+// Derived rather than enumerated because the failure is an OMISSION: adding an
+// optional field to `WorkoutSet` is a one-line edit, and nothing about it
+// prompts the author to think about a merge three files away. Deriving both
+// sides means a new field has to be given one of the two homes or this fails.
+describe('Invariant: every WorkoutSet field is synced or locally preserved (#1357)', () => {
+  const WORKOUT_STORE = readFileSync(join(STORES_DIR, 'workout.ts'), 'utf-8')
+  const REMOTE_ROWS = readFileSync(join(SRC_DIR, 'lib/remoteRows.ts'), 'utf-8')
+  const PRESERVER = readFileSync(join(SRC_DIR, 'lib/localOnlySetFields.ts'), 'utf-8')
+
+  /** Property names declared in `export interface <name> { … }`, comments stripped. */
+  function interfaceFields(source: string, name: string): Set<string> {
+    const start = source.indexOf(`export interface ${name} {`)
+    if (start === -1) return new Set()
+    const from = source.indexOf('{', start)
+    let depth = 0
+    let end = -1
+    for (let i = from; i < source.length; i++) {
+      if (source[i] === '{') depth++
+      else if (source[i] === '}' && --depth === 0) { end = i; break }
+    }
+    const body = stripComments(source.slice(from + 1, end))
+    return new Set([...body.matchAll(/^\s*([A-Za-z_$][\w$]*)\??\s*:/gm)].map(m => m[1]))
+  }
+
+  /** Domain keys the given mapper assigns from a remote row. */
+  function mappedFields(source: string, marker: string): Set<string> {
+    const start = source.indexOf(marker)
+    if (start === -1) return new Set()
+    const body = stripComments(source.slice(start, source.indexOf('\n}', start)))
+    return new Set([...body.matchAll(/^\s*([A-Za-z_$][\w$]*)\s*:/gm)].map(m => m[1]))
+  }
+
+  /** Members of the `LOCAL_ONLY_SET_FIELDS` tuple. */
+  function preservedFields(): Set<string> {
+    const decl = PRESERVER.slice(PRESERVER.indexOf('export const LOCAL_ONLY_SET_FIELDS'))
+    const literal = decl.slice(decl.indexOf('['), decl.indexOf(']') + 1)
+    return new Set((literal.match(/'[\w$]+'/g) ?? []).map(q => q.slice(1, -1)))
+  }
+
+  it('the extractors read real declarations (non-vacuity)', () => {
+    const fields = interfaceFields(WORKOUT_STORE, 'WorkoutSet')
+    // Anchors on both sides of the split, so neither extractor can go empty and
+    // report green over a rule it never actually evaluated.
+    for (const f of ['id', 'date', 'weight', 'reps', 'estimated1RM', 'rpe', 'bodyweight']) {
+      expect(fields.has(f)).toBe(true)
+    }
+    // A JSDoc'd field must survive comment stripping — `createdAt` and
+    // `bodyweight` both carry multi-line blocks that name other fields.
+    expect(fields.has('createdAt')).toBe(true)
+    expect(mappedFields(REMOTE_ROWS, 'export function mapRemoteSet').has('estimated1RM')).toBe(true)
+    expect(preservedFields()).toEqual(new Set(['rpe', 'bodyweight']))
+  })
+
+  it('the derivation flags a field that is neither synced nor preserved (self-test)', () => {
+    const source = [
+      'export interface Fake {',
+      '  id: string',
+      '  /** A comment naming rpe: 9 must not register as a field. */',
+      '  tempo?: number',
+      '}',
+    ].join('\n')
+    const fields = interfaceFields(source, 'Fake')
+    expect(fields).toEqual(new Set(['id', 'tempo']))
+    expect([...fields].filter(f => !new Set(['id']).has(f))).toEqual(['tempo'])
+  })
+
+  it('no WorkoutSet field is both un-synced and unpreserved', () => {
+    const mapped = mappedFields(REMOTE_ROWS, 'export function mapRemoteSet')
+    const preserved = preservedFields()
+    const orphans = [...interfaceFields(WORKOUT_STORE, 'WorkoutSet')]
+      .filter(f => !mapped.has(f) && !preserved.has(f))
+
+    expect(orphans, orphans.length === 0 ? '' :
+      `WorkoutSet.${orphans.join(', WorkoutSet.')} round-trips through neither ` +
+      'Supabase (mapRemoteSet) nor LOCAL_ONLY_SET_FIELDS, so a remote-winning ' +
+      'merge silently erases it for every set that exists on both sides ' +
+      '(#1357). Give it a `sets` column, or add it to LOCAL_ONLY_SET_FIELDS.',
+    ).toEqual([])
+  })
+
+  it('nothing is listed as local-only that the sync path actually carries', () => {
+    // The mirror failure: once a field gains a column, remote-wins has to keep
+    // meaning remote-wins, so it must leave the preserved list in the same
+    // commit — restore would otherwise re-attach a stale local value.
+    const mapped = mappedFields(REMOTE_ROWS, 'export function mapRemoteSet')
+    expect([...preservedFields()].filter(f => mapped.has(f))).toEqual([])
+  })
+})
