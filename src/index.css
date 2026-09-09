@@ -1940,10 +1940,14 @@ html.theme-fading .settingsSheet {
 }
 
 .settingsInput {
-  width: 96px;
+  /* Wider than the 96px it replaced to keep the widest value this class
+     carries — the PR-baseline `type="date"`, which iOS renders as
+     "12/28/2026" — from clipping now that the text sits at the 16px floor
+     below. The row is space-between, so the label group absorbs the 16px. */
+  width: 112px;
   padding: 8px 12px;
   min-height: 44px;
-  font-size: var(--font-subhead);
+  font-size: var(--font-callout);  /* 16px — iOS focus-zoom floor, LIFT-1376 */
   font-family: inherit;
   font-variant-numeric: tabular-nums;
   color: var(--text-primary);
@@ -3028,7 +3032,7 @@ html.theme-fading .settingsSheet {
 .wtSearchInput {
   flex: 1;
   padding: 12px 12px 12px 32px;
-  font-size: 0.875rem;  /* 14px */
+  font-size: var(--font-callout);  /* 16px — iOS focus-zoom floor, LIFT-1376 */
   font-family: inherit;
   color: var(--text-primary);
   background: var(--bg-elevated);
@@ -3217,9 +3221,13 @@ html.theme-fading .settingsSheet {
   text-align: center;
 }
 
+/* Always worn alongside .repMaxInput, which already carries the 16px iOS
+   focus-zoom floor. Restated rather than dropped so the floor holds whichever
+   rule the cascade happens to land on — source order is not a guarantee to
+   rest a WCAG floor on (LIFT-1376). */
 .wtTagManagerInput {
   flex: 1;
-  font-size: var(--font-subhead);
+  font-size: var(--font-callout);
 }
 
 .wtTagManagerEditBtn,
@@ -3365,10 +3373,14 @@ html.theme-fading .settingsSheet {
    Stretch alone would not cover it: with no tags/gyms configured yet this input
    is the only item in the row and has nothing to stretch against. */
 .wtTagInlineInput {
-  width: 96px;
+  /* Wider than the 96px it replaced because the text grew to the 16px
+     focus-zoom floor below — at footnote size the "Gym name" placeholder
+     just fit; at callout it would clip. The row wraps, so this costs
+     nothing but a slightly earlier wrap. */
+  width: 128px;
   min-height: 44px;
   padding: 8px 12px;
-  font-size: var(--font-footnote);
+  font-size: var(--font-callout);  /* 16px — iOS focus-zoom floor, LIFT-1376 */
   font-family: inherit;
   color: var(--text-primary);
   background: var(--bg-hover);
@@ -6347,6 +6359,10 @@ html.theme-fading .settingsSheet {
   cursor: pointer;
   border: none;
   padding: 0;
+  /* Invisible, but iOS still zooms the page when a control under 16px takes
+     focus — and a date input takes focus the moment the picker opens. With no
+     declaration here the UA default (~13px) applied. LIFT-1376. */
+  font-size: var(--font-callout);
   /* Ensure the overlay sits above the label span so real taps (not
      programmatic) land on the input. iOS only opens the native date
      picker for direct user touches on a type="date" input. */
@@ -8444,7 +8460,7 @@ html.theme-fading .settingsSheet {
   width: 100%;
   padding: 12px;
   min-height: 44px;
-  font-size: var(--font-subhead);
+  font-size: var(--font-callout);  /* 16px — iOS focus-zoom floor, LIFT-1376 */
   font-family: inherit;
   color: var(--text-primary);
   background: var(--bg-primary);

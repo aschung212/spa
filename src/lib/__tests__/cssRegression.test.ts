@@ -1201,3 +1201,170 @@ describe('Custom-property token definitions', () => {
     }
   })
 })
+
+/**
+ * iOS focus-zoom floor (LIFT-1376).
+ *
+ * iOS Safari zooms the whole page when a form control smaller than 16px takes
+ * focus, and never zooms back out. index.html used to suppress that with
+ * `maximum-scale=1.0, user-scalable=no` — which also blocks pinch-zoom, a WCAG
+ * 2.1 AA failure on 1.4.4 and 1.4.10. Lifting the lock (see the viewport pin in
+ * metaRegression.test.ts) hands the zoom-on-focus behaviour back, so the floor
+ * has to be met by the controls themselves: seven of them computed under 16px
+ * and would have started yanking the layout on every tap.
+ *
+ * DERIVED, not enumerated. A hardcoded class list would only ever pin the
+ * inputs that existed the day it was written, and the two halves of this fix
+ * live in different files — the next input added with a `--font-subhead` label
+ * style would silently re-break zoom-free focus with the meta tag still (and
+ * correctly) permissive. So the controls come out of the .vue templates and the
+ * sizes out of the stylesheets, and a new control with no font-size rule at all
+ * fails too: form controls do NOT inherit `body`'s font-size, they fall back to
+ * the UA default (~13px), which is under the floor.
+ *
+ * Deliberately stricter than the real cascade: EVERY rule that can style a
+ * control must clear 16px, not just whichever one happens to win. Resting a
+ * WCAG floor on source order is how `.wtTagManagerInput` came to carry a dead
+ * 15px declaration that only looked harmless because `.repMaxInput` sits
+ * further down the file.
+ */
+describe('iOS focus-zoom floor: text controls are at least 16px (LIFT-1376)', () => {
+  const SRC = resolve(__dirname, '../..')
+  const MIN_PX = 16
+  const ROOT_PX = 16 // 1rem at the default root size, which index.css never pins
+
+  // --- font-size values, resolved to px ------------------------------------
+
+  const stripComments = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, '')
+
+  const fontTokens = new Map<string, number>()
+  for (const m of stripComments(css).matchAll(/(--font-[a-z0-9-]+)\s*:\s*([\d.]+)(rem|px)\s*;/gi)) {
+    fontTokens.set(m[1], m[3].toLowerCase() === 'rem' ? parseFloat(m[2]) * ROOT_PX : parseFloat(m[2]))
+  }
+
+  /** px for a font-size value, or null when it can't be resolved statically. */
+  function toPx(value: string): number | null {
+    const varRef = value.match(/^var\(\s*(--[a-z0-9-]+)\s*\)$/i)
+    if (varRef) return fontTokens.get(varRef[1]) ?? null
+    const unit = value.match(/^([\d.]+)(rem|px|em)$/i)
+    if (!unit) return null
+    const n = parseFloat(unit[1])
+    return unit[2].toLowerCase() === 'px' ? n : n * ROOT_PX
+  }
+
+  // --- font-size declarations, keyed by the file they can reach ------------
+  // Every .vue <style> block in this app is `scoped`, so a component's rules
+  // only ever style that component. index.css is the global sheet.
+
+  type FontRule = { selector: string; raw: string; px: number | null; origin: string; scope: string | null }
+  const fontRules: FontRule[] = []
+
+  function collectFontRules(source: string, origin: string, scope: string | null): void {
+    // Innermost-rule match: the inner `[^{}]*` can't span a nested block, so an
+    // at-rule prelude (@media/@supports) never captures as a selector while the
+    // rules inside it still do.
+    for (const m of stripComments(source).matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      const decl = m[2].match(/(?:^|;)\s*font-size\s*:\s*([^;]+)/)
+      if (!decl) continue
+      const raw = decl[1].trim()
+      for (const selector of m[1].split(',')) {
+        fontRules.push({ selector: selector.trim(), raw, px: toPx(raw), origin, scope })
+      }
+    }
+  }
+
+  collectFontRules(css, 'src/index.css', null)
+
+  // --- the controls themselves, out of the templates -----------------------
+
+  // Types that never open a text-entry keyboard, so never trigger focus zoom.
+  const EXEMPT_TYPES = new Set([
+    'range', 'checkbox', 'radio', 'file', 'hidden', 'submit', 'reset', 'button', 'image',
+  ])
+
+  type Control = { file: string; line: number; tag: string; type: string; classes: string[] }
+  const controls: Control[] = []
+
+  const templateFiles = [...collectVueFiles(SRC), resolve(SRC, '../index.html').replace(/\\/g, '/')]
+  for (const file of templateFiles) {
+    const content = readFileSync(file, 'utf-8')
+    const rel = relative(resolve(SRC, '..'), file).replace(/\\/g, '/')
+
+    if (file.endsWith('.vue')) {
+      const style = allVueStyleBlocks(content)
+      if (style.trim()) collectFontRules(style, rel, file)
+    }
+
+    for (const m of content.matchAll(/<(input|textarea|select)\b([^>]*?)\/?>/g)) {
+      const attrs = m[2]
+      // A bound :type is unresolvable here; assume the zooming case.
+      const type = m[1] === 'input' ? (attrs.match(/\btype="([^"]*)"/)?.[1] ?? 'text') : m[1]
+      if (EXEMPT_TYPES.has(type)) continue
+      controls.push({
+        file: rel,
+        line: content.slice(0, m.index).split('\n').length,
+        tag: m[1],
+        type,
+        classes: (attrs.match(/\bclass="([^"]*)"/)?.[1] ?? '').split(/\s+/).filter(Boolean),
+      })
+    }
+  }
+
+  /** Does `selector` style `c`? Conservative: unresolvable qualifiers say no. */
+  function ruleMatches(selector: string, c: Control): boolean {
+    if (selector.startsWith('@') || selector.includes('::')) return false
+    // Only the rightmost compound selector describes the element itself.
+    const compound = selector.split(/\s*[>+~]\s*|\s+/).filter(Boolean).pop()
+    if (!compound) return false
+    const bare = compound.replace(/:[a-z-]+(\([^)]*\))?/gi, '')
+    const classes = [...bare.matchAll(/\.([A-Za-z0-9_-]+)/g)].map((x) => x[1])
+    if (classes.length === 0) return false
+    const rest = bare.replace(/\.[A-Za-z0-9_-]+/g, '')
+    // An id or attribute qualifier can't be resolved from the template alone.
+    if (rest.includes('#') || rest.includes('[')) return false
+    const tag = rest.match(/^[a-z][a-z0-9-]*/i)?.[0]
+    if (tag && tag.toLowerCase() !== c.tag) return false
+    return classes.every((cl) => c.classes.includes(cl))
+  }
+
+  it('found the controls and the font tokens to check them against', () => {
+    // Guards the derivation: a regex that stopped matching would turn the
+    // check below into an assertion about an empty list.
+    expect(fontTokens.get('--font-callout')).toBe(16)
+    expect(fontTokens.get('--font-subhead')).toBe(15)
+    expect(controls.length).toBeGreaterThan(20)
+    expect(fontRules.length).toBeGreaterThan(100)
+    // One from index.css, one from a scoped component block, one from a view.
+    expect(controls.some((c) => c.classes.includes('wtSearchInput'))).toBe(true)
+    expect(controls.some((c) => c.classes.includes('recDaysInput'))).toBe(true)
+    expect(controls.some((c) => c.classes.includes('authInput'))).toBe(true)
+    // The date overlay is invisible but still takes focus — it must be in scope.
+    expect(controls.some((c) => c.type === 'date')).toBe(true)
+  })
+
+  it('every focusable text control computes to at least 16px', () => {
+    const offenders: string[] = []
+
+    for (const c of controls) {
+      const where = `${c.file}:${c.line} <${c.tag} type="${c.type}" class="${c.classes.join(' ') || '(none)'}">`
+      const matched = fontRules.filter((r) => (r.scope === null || r.origin === c.file) && ruleMatches(r.selector, c))
+
+      if (matched.length === 0) {
+        offenders.push(`${where} — no font-size rule; form controls do not inherit body's, so this lands on the UA default (~13px)`)
+        continue
+      }
+      for (const r of matched) {
+        if (r.px === null) {
+          offenders.push(`${where} — ${r.origin} \`${r.selector}\` font-size: ${r.raw} cannot be resolved to px`)
+        } else if (r.px < MIN_PX) {
+          offenders.push(`${where} — ${r.origin} \`${r.selector}\` font-size: ${r.raw} = ${r.px}px, under the ${MIN_PX}px floor`)
+        }
+      }
+    }
+
+    expect(
+      offenders,
+      `controls under the iOS focus-zoom floor (raise them to var(--font-callout); never re-add user-scalable=no):\n${offenders.join('\n')}`,
+    ).toEqual([])
+  })
+})
