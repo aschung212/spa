@@ -40,6 +40,17 @@
  *    touches the absorbed row, and `updated_at` is deliberately NOT bumped — a
  *    freshened timestamp would let the merged copy win a later last-write-wins
  *    comparison and propagate a heuristic as though the user had made an edit.
+ *
+ *    The merged object can still reach the server by the pre-existing route: if
+ *    the primary is in `localWins`/`localOnly`, `_fetchFromSupabase` upserts it
+ *    afterwards, and `_buildExerciseUpsert` always sends every column. That has
+ *    been true of the tag union since the beginning and of the gym union since
+ *    #961, so filling seven more fields is the same class of write rather than a
+ *    new one — and it stays inside the SEV1 boundary because every one of them
+ *    is ADDITIVE (a gap acquires a value the same user already set on their own
+ *    other row) and idempotent, never a delete or a re-parent. Any future field
+ *    whose fill would DESTROY something on the primary belongs on `primary`, not
+ *    `fill`, for exactly this reason — see `archived_at`.
  * 2. **No hand-maintained list.** The failure mode here is an OMISSION: adding a
  *    field to `Exercise` is a one-line edit and nothing about it prompts the
  *    author to think about a merge in another file. So the policy is a total map
