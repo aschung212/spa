@@ -2572,6 +2572,74 @@ describe('WorkoutTracker', () => {
         )
       })
     })
+
+    /**
+     * LIFT-1373 — reading the set back out in words. Both of the tracker's
+     * read-back surfaces echoed `set.weight` bare, so the set LIFT-1330 made
+     * typeable was confirmed as "0 lbs × 12 reps" — the only feedback a
+     * screen-reader user gets after a save, saying they moved nothing.
+     */
+    describe('reads a set back in ADDED-space words (LIFT-1373)', () => {
+      const saveBtn = (wrapper: VueWrapper) => wrapper.find('.repMaxBtn.repMaxBtnCalc')
+
+      async function saveAndRead(wrapper: VueWrapper, added: string, reps: string) {
+        await wrapper.find(ADDED_FIELD).setValue(added)
+        await wrapper.find('input[aria-label="Reps"]').setValue(reps)
+        await saveBtn(wrapper).trigger('click')
+        // announceSet clears then re-sets on nextTick so identical re-logs re-fire.
+        await wrapper.vm.$nextTick()
+        await wrapper.vm.$nextTick()
+        // Re-find: Vue replaces the text node, so a held wrapper is stale.
+        return wrapper.find('.repMaxModal .srOnly[aria-live="polite"]').text()
+      }
+
+      it('announces a pure-bodyweight save as "Bodyweight"', async () => {
+        const wrapper = mountTracker()
+        await openPullupModal(wrapper)
+        expect(await saveAndRead(wrapper, '0', '12')).toBe('Logged Pull-Up: Bodyweight × 12 reps')
+      })
+
+      it('announces an added weight as added', async () => {
+        const wrapper = mountTracker()
+        await openPullupModal(wrapper)
+        expect(await saveAndRead(wrapper, '25', '5')).toBe('Logged Pull-Up: +25 lbs × 5 reps')
+      })
+
+      it('leaves a normal exercise announcing the plain weight', async () => {
+        mockState.exercises = [{ id: 'ex-1', name: 'Bench Press', tags: [], sets: [] }]
+        const wrapper = mountTracker()
+        await openPullupModal(wrapper)
+        await wrapper.find('input[aria-label="Weight"]').setValue('185')
+        await wrapper.find('input[aria-label="Reps"]').setValue('5')
+        await saveBtn(wrapper).trigger('click')
+        await wrapper.vm.$nextTick()
+        await wrapper.vm.$nextTick()
+        expect(wrapper.find('.repMaxModal .srOnly[aria-live="polite"]').text())
+          .toBe('Logged Bench Press: 185 lbs × 5 reps')
+      })
+
+      // The edit path's "Set updated: …" string goes through the same
+      // `setLoadLabel`, but it cannot be asserted from the DOM: `saveSet`
+      // calls `closeModal()` synchronously after `announceSet`, which unmounts
+      // the live region before the nextTick that fills it. That announcement
+      // has never reached anyone — pre-existing, filed separately.
+
+      it('reads the exercise row last-set meta in the same words', async () => {
+        // The row meta is the list surface's own read-back — the same set,
+        // one screen up from the sheet that just announced it.
+        const wrapper = mountTracker()
+        expect(wrapper.find('.wtExerciseStat').text()).toContain('+25 lbs')
+
+        mockState.exercises = [{
+          id: 'ex-1', name: 'Pull-Up', tags: ['Back'], bodyweightLoaded: true,
+          sets: [{ id: 's-1', date: '2026-01-20T12:00:00', weight: 0, reps: 12, bodyweight: BODYWEIGHT, estimated1RM: epley(BODYWEIGHT, 12) }],
+        }]
+        const bwOnly = mountTracker()
+        const stat = bwOnly.find('.wtExerciseStat').text()
+        expect(stat).toContain('Bodyweight')
+        expect(stat).not.toContain('0 lbs')
+      })
+    })
   })
 
   /**

@@ -4,7 +4,9 @@ import {
   allowsZeroWeight,
   bodyweightFold,
   effectiveSetWeight,
+  formatSetLoad,
   isLoggableWeight,
+  setLoadParts,
 } from '../bodyweightLoad'
 import type { WorkoutSet } from '../../stores/workout'
 
@@ -125,5 +127,78 @@ describe('isLoggableWeight (LIFT-1330)', () => {
   it('passes ordinary positive weights through unchanged', () => {
     expect(isLoggableWeight(135, { bodyweightLoaded: false })).toBe(true)
     expect(isLoggableWeight(2.5, { bodyweightLoaded: true })).toBe(true)
+  })
+})
+
+describe('formatSetLoad (LIFT-1373)', () => {
+  // Display-unit converters matching `useWeightUnit`, so the formatter is
+  // exercised in the two spaces the app actually renders in.
+  const lbs = { displayWeight: (v: number) => +v.toFixed(1), unit: 'lbs' }
+  const kg = { displayWeight: (v: number) => +(v * 0.453592).toFixed(1), unit: 'kg' }
+
+  it('names the load "Bodyweight" when the lifter added nothing', () => {
+    // The defect: this row read "0 lbs x 12" beside a ~224 lb e1RM computed
+    // off the folded load — one row saying the lifter moved nothing.
+    expect(formatSetLoad(set({ weight: 0, bodyweight: 170 }), { bodyweightLoaded: true }, lbs))
+      .toBe('Bodyweight')
+  })
+
+  it('marks a non-zero added weight with a "+"', () => {
+    expect(formatSetLoad(set({ weight: 25, bodyweight: 160 }), { bodyweightLoaded: true }, lbs))
+      .toBe('+25 lbs')
+  })
+
+  it('renders an ordinary exercise exactly as before', () => {
+    expect(formatSetLoad(set({ weight: 135 }), { bodyweightLoaded: false }, lbs)).toBe('135 lbs')
+    expect(formatSetLoad(set({ weight: 135 }), null, lbs)).toBe('135 lbs')
+    expect(formatSetLoad(set({ weight: 135 }), undefined, lbs)).toBe('135 lbs')
+  })
+
+  it('keys on the fold actually applied, not on the flag alone', () => {
+    // A set logged before the flag was turned on folds in nothing, so its
+    // stored e1RM is off the bare weight. Saying "Bodyweight" here would claim
+    // a bodyweight the set never recorded — and contradict the ~0 e1RM beside
+    // it. The label always describes what the neighbouring e1RM came from.
+    expect(formatSetLoad(set({ weight: 0, bodyweight: undefined }), { bodyweightLoaded: true }, lbs))
+      .toBe('0 lbs')
+    expect(formatSetLoad(set({ weight: 25, bodyweight: undefined }), { bodyweightLoaded: true }, lbs))
+      .toBe('25 lbs')
+  })
+
+  it('converts the added portion into the display unit', () => {
+    // "Bodyweight" is unit-free by construction, which is half of why the word
+    // is right: there is no number to convert or mis-space (LIFT-1315).
+    expect(formatSetLoad(set({ weight: 25, bodyweight: 160 }), { bodyweightLoaded: true }, kg))
+      .toBe('+11.3 kg')
+    expect(formatSetLoad(set({ weight: 0, bodyweight: 160 }), { bodyweightLoaded: true }, kg))
+      .toBe('Bodyweight')
+  })
+
+  it('does not prefix a "+" onto a negative added weight', () => {
+    // `isLoggableWeight` refuses these at entry, but a hand-edited or imported
+    // row must still read as a number rather than "+-5".
+    expect(formatSetLoad(set({ weight: -5, bodyweight: 160 }), { bodyweightLoaded: true }, lbs))
+      .toBe('-5 lbs')
+  })
+
+  it('splits into parts that rejoin into the same string', () => {
+    // `setLoadParts` exists for the PR card, which styles the unit separately.
+    // Both shapes come from one decision, so they cannot disagree about
+    // whether a set was bodyweight-only.
+    const bw = set({ weight: 0, bodyweight: 170 })
+    const added = set({ weight: 25, bodyweight: 170 })
+    const plain = set({ weight: 135 })
+    const cases = [
+      [bw, { bodyweightLoaded: true }],
+      [added, { bodyweightLoaded: true }],
+      [plain, { bodyweightLoaded: false }],
+    ] as const
+    for (const [s, ex] of cases) {
+      const parts = setLoadParts(s, ex, lbs)
+      const rejoined = parts.unit ? parts.value + ' ' + parts.unit : parts.value
+      expect(rejoined).toBe(formatSetLoad(s, ex, lbs))
+    }
+    expect(setLoadParts(bw, { bodyweightLoaded: true }, lbs)).toEqual({ value: 'Bodyweight', unit: null })
+    expect(setLoadParts(plain, null, lbs)).toEqual({ value: '135', unit: 'lbs' })
   })
 })

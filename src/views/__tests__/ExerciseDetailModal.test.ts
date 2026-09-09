@@ -66,6 +66,9 @@ vi.mock('../../components/ExerciseGraph.vue', () => ({
 // ── Fixtures ─────────────────────────────────────────────────────
 function makeSet(over: Partial<WorkoutSet> & { weight: number; reps: number; estimated1RM: number }): WorkoutSet {
   return {
+    // Spread first so optional fields (rpe, bodyweight — the local-only ones a
+    // fixture must be able to set) survive rather than being dropped.
+    ...over,
     id: over.id ?? `s-${Math.random().toString(36).slice(2)}`,
     date: over.date ?? '2026-01-01T12:00:00',
     weight: over.weight,
@@ -450,6 +453,83 @@ describe('ExerciseDetailModal', () => {
       await wrapper.find('.wtSetActions button[aria-label="Delete set"]').trigger('click')
       expect(wrapper.emitted('delete-set')![0][0]).toBe('ex-1')
       expect((wrapper.emitted('delete-set')![0][1] as WorkoutSet).id).toBe('s-3')
+    })
+  })
+
+  /**
+   * LIFT-1373 — a set's load reads in ADDED-space words on a bodyweight-loaded
+   * exercise. Every fixture above uses a positive weight on an unflagged
+   * exercise, which is exactly why the contradiction (a "0 lbs" row beside an
+   * e1RM computed off the folded load) was never visible to this suite.
+   */
+  describe('bodyweight-loaded set rows (LIFT-1373)', () => {
+    // A weighted PR, then a pure-bodyweight one that beats it — two ascending
+    // PR entries, so the PRs tab renders too.
+    function pullUpExercise(): Exercise {
+      return {
+        id: 'ex-1',
+        name: 'Pull-Up',
+        tags: ['Back'],
+        bodyweightLoaded: true,
+        sets: [
+          makeSet({ id: 'bw-1', date: '2026-01-01T12:00:00', weight: 25, reps: 5, estimated1RM: 227, bodyweight: 170 }),
+          makeSet({ id: 'bw-2', date: '2026-01-08T12:00:00', weight: 0, reps: 12, estimated1RM: 238, bodyweight: 170 }),
+        ],
+      }
+    }
+
+    it('reads a pure-bodyweight set as "Bodyweight", not "0 lbs"', () => {
+      setExercises([pullUpExercise()])
+      const wrapper = mountModal()
+      // Newest-first: the bodyweight-only set leads, the weighted set follows.
+      const rows = wrapper.findAll('.wtSetDetail').map((r) => r.text())
+      expect(rows).toEqual(['Bodyweight × 12', '+25 lbs × 5'])
+      expect(rows.join(' ')).not.toContain('0 lbs')
+    })
+
+    it('gives each row an accessible name matching its visible text', () => {
+      setExercises([pullUpExercise()])
+      const wrapper = mountModal()
+      const triggers = wrapper.findAll('.wtSetRowMain')
+      const details = wrapper.findAll('.wtSetDetail')
+      triggers.forEach((trigger, i) => {
+        expect(trigger.attributes('aria-label')).toContain(details[i].text())
+      })
+      expect(triggers[0].attributes('aria-label')).toContain('Bodyweight × 12')
+    })
+
+    it('keeps "0 lbs" for a flagged set that folded nothing in', () => {
+      // Logged before the flag was turned on (no captured bodyweight), so the
+      // stored e1RM is off the bare weight — claiming "Bodyweight" here would
+      // contradict the number rendered beside it.
+      setExercises([
+        {
+          id: 'ex-1',
+          name: 'Pull-Up',
+          tags: [],
+          bodyweightLoaded: true,
+          sets: [makeSet({ id: 'pre-flag', weight: 0, reps: 12, estimated1RM: 0 })],
+        },
+      ])
+      const wrapper = mountModal()
+      expect(wrapper.find('.wtSetDetail').text()).toBe('0 lbs × 12')
+    })
+
+    it('names the PR card the same way, keeping the unit styled separately', async () => {
+      setExercises([pullUpExercise()])
+      const wrapper = mountModal()
+      const prTab = wrapper.findAll('.wtDetailTab').find((t) => t.text().includes('PRs'))!
+      await prTab.trigger('click')
+      const cards = wrapper.findAll('.wtPRCard')
+      // Current PR first: the 238 e1RM pure-bodyweight set.
+      expect(cards[0].find('.wtPRCardValue').text()).toContain('Bodyweight')
+      expect(cards[0].find('.wtPRCardValue').text()).not.toContain('0 lbs')
+      // The word carries no unit, so the unit span drops rather than rendering
+      // a dangling "lbs" after it.
+      expect(cards[0].find('.wtPRCardUnit').exists()).toBe(false)
+      // A weighted PR still styles its unit apart from the number.
+      expect(cards[1].find('.wtPRCardValue').text()).toContain('+25')
+      expect(cards[1].find('.wtPRCardUnit').text()).toBe('lbs')
     })
   })
 })

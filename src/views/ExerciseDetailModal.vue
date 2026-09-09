@@ -68,7 +68,7 @@
                       :aria-label="setRowLabel(set, group.key)"
                       @click="toggleSetActions(set.id)"
                     >
-                      <span class="wtSetDetail">{{ displayWeight(set.weight) }} {{ weightUnit }} × {{ set.reps }}</span>
+                      <span class="wtSetDetail">{{ setLoad(set) }} × {{ set.reps }}</span>
                       <span
                         v-if="set.attemptedNextRep"
                         class="wtEffortBadge"
@@ -111,7 +111,7 @@
               <template v-for="(pr, i) in prHistory" :key="pr.id">
                 <div :class="['wtPRCard', { wtPRCardCurrent: i === 0 }]">
                   <div class="wtPRCardTop">
-                    <span class="wtPRCardValue">{{ displayWeight(pr.weight) }} <span class="wtPRCardUnit">{{ weightUnit }}</span> <span class="wtPRCardReps">× {{ pr.reps }}</span></span>
+                    <span class="wtPRCardValue">{{ pr.load.value }} <span v-if="pr.load.unit" class="wtPRCardUnit">{{ pr.load.unit }}</span> <span class="wtPRCardReps">× {{ pr.reps }}</span></span>
                     <span v-if="i === 0" class="wtPRCardBadge">Current</span>
                   </div>
                   <div class="wtPRCardBottom">
@@ -155,6 +155,7 @@ import { useFocusTrap } from '../composables/useFocusTrap'
 import { usePreferencesStore } from '../stores/preferences'
 import { setDayKey, formatShortDate } from '../lib/dates'
 import { buildWarmupSetIds } from '../lib/classifyWarmupSets'
+import { formatSetLoad, setLoadParts, type SetLoadParts } from '../lib/bodyweightLoad'
 import ExerciseGraph from '../components/ExerciseGraph.vue'
 import InfoPopover from '../components/InfoPopover.vue'
 import type { Exercise, WorkoutSet } from '../stores/workout'
@@ -162,6 +163,8 @@ import type { Exercise, WorkoutSet } from '../stores/workout'
 interface PREntry extends WorkoutSet {
   daysSince: number | null
   e1rmDelta: number | null
+  /** Pre-split so the card can style the unit without re-deciding the words. */
+  load: SetLoadParts
 }
 
 const props = defineProps<{
@@ -187,6 +190,17 @@ const SET_LIMIT = 10
 const exercise = computed((): Exercise | null =>
   props.exerciseId ? store.exercises.find(e => e.id === props.exerciseId) ?? null : null
 )
+
+const loadFormat = computed(() => ({ displayWeight, unit: weightUnit.value }))
+
+/**
+ * The set's load in the words the app uses for it — "Bodyweight", "+25 lbs",
+ * "135 lbs" (LIFT-1373). Shared by the visible row text and its accessible
+ * name so the two cannot disagree about what the number means.
+ */
+function setLoad(set: WorkoutSet): string {
+  return formatSetLoad(set, exercise.value, loadFormat.value)
+}
 
 // ── Tab state ─────────────────────────────────────────────────────
 const detailTab = ref<'sets' | 'prs'>('sets')
@@ -287,7 +301,7 @@ function toggleSetActions(setId: string) {
  */
 function setRowLabel(set: WorkoutSet, dayKey: string): string {
   const parts = [
-    `${formatShortDate(dayKey + 'T12:00:00')}: ${displayWeight(set.weight)} ${weightUnit.value} × ${set.reps}`,
+    `${formatShortDate(dayKey + 'T12:00:00')}: ${setLoad(set)} × ${set.reps}`,
   ]
   // The badge spans carry their own aria-labels, but a child's label does not
   // reach a parent that has one of its own — so restate them here or they are
@@ -357,6 +371,7 @@ const prHistory = computed((): PREntry[] => {
   const sorted = Object.values(byDay).sort((a, b) => a.date.localeCompare(b.date))
   const prs: PREntry[] = sorted.map((pr, i) => ({
     ...pr,
+    load: setLoadParts(pr, exercise.value, loadFormat.value),
     daysSince: i > 0
       ? Math.round((new Date(pr.date).getTime() - new Date(sorted[i - 1].date).getTime()) / 86400000)
       : null,

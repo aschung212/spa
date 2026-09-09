@@ -214,7 +214,7 @@
                   class="wtExerciseTag"
                 >{{ tag }}</span>
                 <span v-if="rowMetaByExercise[exercise.id]?.lastSet" class="wtExerciseStat">
-                  · {{ displayWeight(rowMetaByExercise[exercise.id]!.lastSet!.weight) }} {{ weightUnit }}
+                  · {{ rowMetaByExercise[exercise.id]!.lastSet!.load }}
                   × {{ rowMetaByExercise[exercise.id]!.lastSet!.reps }}
                   · {{ rowMetaByExercise[exercise.id]!.timeAgo }}
                 </span>
@@ -1062,7 +1062,7 @@ import { platesToWeight, weightToPlates, defaultBarWeight, LBS_PLATES, KG_PLATES
 import { generateIntensityTable, DEFAULT_INTENSITY_MAX_REPS, type IntensityRow } from '../lib/intensityTable'
 import { applyStreakMultiplier, isExerciseEstablished, XP_CONFIG } from '../lib/xp'
 import { epley } from '../lib/epley'
-import { allowsZeroWeight, isLoggableWeight } from '../lib/bodyweightLoad'
+import { allowsZeroWeight, formatSetLoad, isLoggableWeight } from '../lib/bodyweightLoad'
 import { scoreSet } from '../lib/setScoring'
 import { useXPCeremony } from '../composables/useXPCeremony'
 import { computeWeeklyGoal } from '../lib/weeklyGoal'
@@ -1559,8 +1559,21 @@ const tagCounts = computed<Record<string, number>>(() => {
  * time-ago, and whether the current baseline-relative PR was set this week
  * (drives the "NEW PR" gold badge in the card).
  */
+/**
+ * A stored set's load in the words the history surfaces use — "Bodyweight",
+ * "+25 lbs", "135 lbs" (LIFT-1373). The exercise-row meta and the post-save
+ * announcement both read a set back, so both go through the one formatter.
+ */
+function setLoadLabel(
+  set: { weight: number; bodyweight?: number },
+  exercise?: Pick<Exercise, 'bodyweightLoaded'> | null,
+): string {
+  return formatSetLoad(set, exercise, { displayWeight, unit: weightUnit.value })
+}
+
 interface ExerciseRowMeta {
-  lastSet: { weight: number; reps: number; date: string } | null
+  /** Pre-formatted load (LIFT-1373) — "Bodyweight", "+25 lbs", "135 lbs". */
+  lastSet: { load: string; reps: number; date: string } | null
   timeAgo: string | null
   isNewPRBadge: boolean
 }
@@ -1571,7 +1584,7 @@ function computeRowMeta(ex: Exercise): ExerciseRowMeta {
   const prSet = store.getExercisePRSet(ex.id, prBaselineDate.value)
   const isFreshPR = !!prSet && (Date.now() - new Date(prSet.date).getTime()) < 7 * 86400000
   return {
-    lastSet: { weight: last.weight, reps: last.reps, date: last.date },
+    lastSet: { load: setLoadLabel(last, ex), reps: last.reps, date: last.date },
     timeAgo: formatTimeAgo(last.date),
     isNewPRBadge: isFreshPR,
   }
@@ -3124,7 +3137,14 @@ function saveSet() {
     const editSetId = editingSet.value.setId
     store.updateSet(editExId, editSetId, toLbs(weight.value), reps.value, date.value, selectedRPE.value, attemptedNextRep.value)
     logEvent('set_edit')
-    announceSet(`Set updated: ${displayWeight(toLbs(weight.value))} ${weightUnit.value} × ${reps.value} rep${reps.value === 1 ? '' : 's'}`)
+    // `bodyweightFoldLbs` carries the edited set's own captured bodyweight
+    // (updateSet preserves it), so the announcement describes the load that
+    // was actually stored rather than today's weigh-in.
+    const editLoad = setLoadLabel(
+      { weight: toLbs(weight.value), bodyweight: bodyweightFoldLbs.value },
+      selectedExercise.value,
+    )
+    announceSet(`Set updated: ${editLoad} × ${reps.value} rep${reps.value === 1 ? '' : 's'}`)
     // Recalc XP for the edited set
     if (progressionStore.progressionEnabled) {
       const ex = store.exercises.find(e => e.id === editExId)
@@ -3211,7 +3231,11 @@ function saveSet() {
       })
       recordNudgeAcceptIfAny(exerciseId, effWeightLbs)
       logEvent('set_log', { exercise: selectedExerciseName.value, isPR: wasPR })
-      announceSet(`Logged ${selectedExerciseName.value}: ${displayWeight(effWeightLbs)} ${weightUnit.value} × ${effReps} rep${effReps === 1 ? '' : 's'}${wasPR ? ', new personal record' : ''}`)
+      const loggedLoad = setLoadLabel(
+        { weight: effWeightLbs, bodyweight: bodyweightFoldLbs.value },
+        selectedExercise.value,
+      )
+      announceSet(`Logged ${selectedExerciseName.value}: ${loggedLoad} × ${effReps} rep${effReps === 1 ? '' : 's'}${wasPR ? ', new personal record' : ''}`)
       // XP: get the just-logged set (last in array) and compute XP
       const exercise = store.exercises.find(e => e.id === exerciseId)
       if (exercise && exercise.sets.length > 0) {

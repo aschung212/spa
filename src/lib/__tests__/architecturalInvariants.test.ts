@@ -1936,3 +1936,58 @@ describe('Invariant: every WorkoutSet field is synced or locally preserved (#135
     expect([...preservedFields()].filter(f => mapped.has(f))).toEqual([])
   })
 })
+
+// ── Invariant: a set-history surface names its load once (LIFT-1373) ──
+//
+// `set.weight` is the ADDED portion on a `bodyweightLoaded` exercise, never
+// the load — that is the whole premise of LIFT-834. Every surface that reads a
+// stored set back rendered it bare anyway, so a pure-bodyweight set showed
+// "0 lbs × 12" beside an e1RM computed off the folded load: the same row
+// saying the lifter moved nothing and estimating a 224 lb max.
+//
+// The rule is DERIVED rather than enumerated. A component that interpolates a
+// stored set's `estimated1RM` is, by construction, showing a folded number —
+// so it is showing the load's other half too, and must name that half through
+// the one formatter. A hardcoded list of components would only ever pin the
+// three that existed when it was written, which is exactly how these three
+// drifted apart in the first place (and how #1333's five volume sums survived
+// LIFT-834). axe cannot see this at all: "0 lbs" is valid, well-labelled,
+// contrast-passing text that happens to be a lie.
+describe('Invariant: a stored-set surface renders its load via formatSetLoad (LIFT-1373)', () => {
+  /** `{{ … estimated1RM … }}` inside a `<template>` block — a rendered e1RM. */
+  const RENDERS_E1RM = /\{\{[^}]*\bestimated1RM\b[^}]*\}\}/
+  const USES_FORMATTER = /\b(?:formatSetLoad|setLoadParts)\b/
+
+  function templateOf(content: string): string {
+    const start = content.indexOf('<template>')
+    const end = content.lastIndexOf('</template>')
+    return start === -1 || end <= start ? '' : content.slice(start, end)
+  }
+
+  const surfaces = getSourceFiles()
+    .filter(f => f.path.endsWith('.vue') && RENDERS_E1RM.test(templateOf(f.content)))
+
+  it('finds the known set-history surfaces', () => {
+    // Non-vacuity: a broken walk or regex would otherwise pass while scanning
+    // nothing. These three are the app's set-history read-back surfaces.
+    expect(surfaces.map(f => f.path).sort()).toEqual([
+      join('components', 'WorkoutTimeline.vue'),
+      join('views', 'CalendarView.vue'),
+      join('views', 'ExerciseDetailModal.vue'),
+    ])
+  })
+
+  it('every one of them names the load through the shared formatter', () => {
+    const violations = surfaces
+      .filter(f => !USES_FORMATTER.test(f.content))
+      .map(f => f.path)
+
+    expect(violations, violations.length === 0 ? '' :
+      `${violations.join(', ')} renders a stored set's estimated1RM — a load ` +
+      'with bodyweight folded in — but derives the weight beside it itself. ' +
+      'On a bodyweightLoaded exercise that prints the ADDED portion as if it ' +
+      'were the load ("0 lbs × 12" next to a ~224 e1RM). Use formatSetLoad / ' +
+      'setLoadParts from lib/bodyweightLoad.',
+    ).toEqual([])
+  })
+})
