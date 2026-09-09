@@ -133,7 +133,11 @@ describe('mapRemoteExercise', () => {
 
   it('rejects a non-finite bar_weight', () => {
     expect(mapRemoteExercise(exRow({ bar_weight: NaN })).barWeight).toBeUndefined()
-    expect(mapRemoteExercise(exRow({ bar_weight: null as unknown as number })).barWeight).toBeUndefined()
+    // A NULL bar_weight is the schema's way of saying "no explicit bar" since
+    // LIFT-1387 — it must stay ABSENT here so the caller falls through to the
+    // unit-aware `defaultBarWeight`, not land as a literal 0 or a stale 45. The
+    // column type carries the null now, so this needs no cast.
+    expect(mapRemoteExercise(exRow({ bar_weight: null })).barWeight).toBeUndefined()
   })
 
   it('rejects an unknown plate_count_mode', () => {

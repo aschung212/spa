@@ -385,7 +385,14 @@ export const useWorkoutStore = defineStore('workout', () => {
       tags: exercise.tags,
       archived_at: exercise.archived_at ?? null,
       ...(exercise.inputMode ? { input_mode: exercise.inputMode } : {}),
-      ...(exercise.barWeight != null ? { bar_weight: exercise.barWeight } : {}),
+      // Always send bar_weight — null means "no explicit bar", which is a real
+      // state the plate math depends on (it falls through to the unit-aware
+      // `defaultBarWeight`). Omitting it used to let the column's own
+      // `NOT NULL DEFAULT 45` fill the gap on insert, so a kg user's untouched
+      // exercise came back holding a 45 **kg** bar and the fallback became
+      // unreachable (LIFT-1387). Requires the nullable column from
+      // 20260909000000_make_bar_weight_nullable.sql.
+      bar_weight: exercise.barWeight ?? null,
       // Always send plate_count_mode (null = client default 'per-side') so a
       // switch back to the default propagates instead of leaving a stale value
       // that re-applies on the next fetch (LIFT-783).

@@ -20,6 +20,7 @@ import { readFileSync, readdirSync } from 'fs'
 import { join, relative, resolve } from 'path'
 import { fileURLToPath } from 'url'
 import { dirname } from 'path'
+import { notNullColumns } from '../../__tests__/migrationSchema'
 
 // ── Shared helpers ──────────────────────────────────────────────────
 
@@ -1373,6 +1374,90 @@ describe('Invariant: REPLAYABLE_COLUMNS stays in lockstep with its producers (LI
         if (!allowed.has(col)) violations.push(`${table}.${col} (sent by ${marker})`)
       }
     }
+    expect(violations).toEqual([])
+  })
+})
+
+// ── Invariant: an always-send `?? null` column is nullable in SQL (LIFT-1387) ──
+
+describe('Invariant: every always-send NULL column is nullable in the migrations (LIFT-1387)', () => {
+  /**
+   * `_buildExerciseUpsert` sends most of its columns unconditionally, using
+   * `?? null` to mean "the user cleared this / never set it". That only works
+   * if the column can actually hold a NULL — otherwise every exercise write
+   * fails with SQLSTATE 23502, and it fails as a RESOLVED `{ error }` rather
+   * than a rejection (LIFT-1321), so nothing throws and the local-first UI
+   * shows the write as saved.
+   *
+   * `bar_weight` reached that shape in LIFT-1387: it had to become nullable in
+   * the same commit that started sending `null` for it, because its
+   * `NOT NULL DEFAULT 45` was what invented a 45 **kg** bar for every kg user
+   * in the first place. The two halves are one change, and this is what keeps
+   * them one change — a revert of either side alone fails here.
+   *
+   * The fake Supabase models column DEFAULTs but not NOT NULL constraints
+   * (teaching it those would reject half the suite's partial-payload fixtures
+   * for unrelated reasons), so a static check is the guard that fits. It is
+   * derived from both sources: the payload's `?? null` columns come out of the
+   * store, the nullability out of the migration corpus, and neither is listed
+   * here.
+   */
+  const WORKOUT_STORE_SRC = readFileSync(join(STORES_DIR, 'workout.ts'), 'utf-8')
+
+  /** The first balanced `{`…`}` block following `marker` ('' if absent). */
+  function bodyAfter(source: string, marker: string): string {
+    const start = source.indexOf(marker)
+    if (start === -1) return ''
+    const from = source.indexOf('{', start + marker.length)
+    if (from === -1) return ''
+    let depth = 0
+    for (let i = from; i < source.length; i++) {
+      if (source[i] === '{') depth++
+      else if (source[i] === '}' && --depth === 0) return source.slice(from, i + 1)
+    }
+    return ''
+  }
+
+  /** Columns a producer sends as `col: <expr> ?? null`. */
+  function nullableSendColumns(source: string, marker: string): string[] {
+    const block = stripComments(bodyAfter(source, marker))
+    const cols: string[] = []
+    for (const m of block.matchAll(/(?:^|[{,])\s*([a-z_][a-z0-9_]*)\s*:[^,{}]*\?\?\s*null/gm)) {
+      cols.push(m[1])
+    }
+    return cols
+  }
+
+  it('the scan finds the exercise upsert’s NULL-sending columns (non-vacuity)', () => {
+    const cols = nullableSendColumns(WORKOUT_STORE_SRC, 'function _buildExerciseUpsert')
+    // Anchors that must be present however the payload is spelled — if the
+    // extractor silently stopped matching, the invariant below would pass by
+    // scanning nothing.
+    expect(cols).toContain('bar_weight')
+    expect(cols).toContain('archived_at')
+    expect(cols).toContain('notes')
+    expect(cols.length).toBeGreaterThanOrEqual(5)
+  })
+
+  it('the scan reads nullability out of the migrations (non-vacuity)', () => {
+    // `name` is NOT NULL from the initial schema and nothing has relaxed it;
+    // `bar_weight` was NOT NULL until LIFT-1387 relaxed it.
+    expect(notNullColumns('exercises').has('name')).toBe(true)
+    expect(notNullColumns('exercises').has('bar_weight')).toBe(false)
+  })
+
+  it('no column sent as `?? null` is declared NOT NULL', () => {
+    const notNull = notNullColumns('exercises')
+    const violations = nullableSendColumns(WORKOUT_STORE_SRC, 'function _buildExerciseUpsert')
+      .filter(col => notNull.has(col))
+      .map(
+        col =>
+          `_buildExerciseUpsert sends exercises.${col} as \`?? null\`, but the ` +
+          'migrations declare it NOT NULL. Postgres answers that with SQLSTATE ' +
+          '23502, which postgrest-js RESOLVES as { error } rather than ' +
+          'rejecting — so every exercise write fails silently. Relax the column ' +
+          'in a migration in the same commit.',
+      )
     expect(violations).toEqual([])
   })
 })

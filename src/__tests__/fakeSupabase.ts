@@ -45,9 +45,19 @@
  * test double that returns unlimited rows doesn't just fail to catch a missing
  * `.range()` — it actively certifies the broken read as correct, which is how
  * the unpaged fetch shipped and hid a month of a real user's training history.
+ *
+ * For the same reason it applies the migrations' literal column DEFAULTs to an
+ * INSERT (LIFT-1387). A store that omits a column does NOT leave it absent in
+ * production — Postgres fills it in, and the next fetch reads that invented
+ * value back as though the user had chosen it. `bar_weight real NOT NULL
+ * DEFAULT 45` did exactly that to every kg user, and no test could see it
+ * because the fake stored only what the payload contained. The defaults are
+ * parsed out of `supabase/migrations` (see `migrationSchema.ts`), so a new
+ * `ADD COLUMN ... DEFAULT` starts being modelled here the day it lands.
  */
 
 import { SUPABASE_MAX_ROWS } from '../lib/supabasePagination'
+import { columnDefaults } from './migrationSchema'
 
 /** The method names a store may invoke on a `supabase.from(...)` query chain. */
 export const FAKE_SUPABASE_CHAIN_METHODS = [
@@ -257,6 +267,23 @@ export class FakeSupabase {
     return this._rejectionError
   }
 
+  /**
+   * A new row with the migrations' literal DEFAULTs filled in for every column
+   * the INSERT payload omits — Postgres's own rule. A key present but
+   * `undefined` counts as omitted: `JSON.stringify` drops it, so it never
+   * reaches PostgREST either.
+   *
+   * `seed()` deliberately does NOT go through this: seeded rows model rows that
+   * already exist server-side in whatever shape the test declares.
+   */
+  private _withDefaults(table: string, rec: Row): Row {
+    const row: Row = { ...rec }
+    for (const [column, value] of columnDefaults(table)) {
+      if (row[column] === undefined) row[column] = value
+    }
+    return row
+  }
+
   private _query(op: Op, table: string, filters: Record<string, unknown>, data: unknown): Row[] {
     const rows = this.tables[table] || (this.tables[table] = [])
     const matches = rows.filter(r =>
@@ -280,8 +307,12 @@ export class FakeSupabase {
       const records = Array.isArray(data) ? (data as Row[]) : [data as Row]
       for (const rec of records) {
         const idx = rows.findIndex(r => r.id === rec.id)
+        // ON CONFLICT DO UPDATE only assigns the columns the payload carries, so
+        // an omitted column keeps its existing value on an update — but takes
+        // its DEFAULT on a fresh insert, which is the half that mattered
+        // (LIFT-1387).
         if (idx >= 0) rows[idx] = { ...rows[idx], ...rec }
-        else rows.push({ ...rec })
+        else rows.push(this._withDefaults(table, rec))
       }
       return records
     }
