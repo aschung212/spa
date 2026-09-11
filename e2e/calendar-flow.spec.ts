@@ -194,7 +194,7 @@ test.describe('Calendar View', () => {
     await page.locator('.calDetail .calLogBtn').click()
 
     // Exercise picker opens first
-    const picker = page.locator('[aria-labelledby="exercise-picker-title"]')
+    const picker = page.locator('[aria-labelledby="calendar-picker-title"]')
     await expect(picker).toBeVisible()
     await expect(picker.locator('.wtExPickerRow', { hasText: 'Bench Press' })).toBeVisible()
 
@@ -216,7 +216,7 @@ test.describe('Calendar View', () => {
   test('logs a new set from the calendar and reflects it in the day summary', async ({ page }) => {
     await page.locator('.calCell.calCellToday').click()
     await page.locator('.calDetail .calLogBtn').click()
-    await page.locator('[aria-labelledby="exercise-picker-title"] .wtExPickerRow', { hasText: 'Back Squat' }).click()
+    await page.locator('[aria-labelledby="calendar-picker-title"] .wtExPickerRow', { hasText: 'Back Squat' }).click()
 
     const modal = page.locator('[aria-labelledby="cal-modal-title"]')
     await expect(modal).toBeVisible()
