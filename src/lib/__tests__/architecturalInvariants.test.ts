@@ -1508,6 +1508,155 @@ describe('Invariant: every always-send NULL column is nullable in the migrations
   })
 })
 
+// ── Invariant: a migration tolerates an object production may not have (LIFT-1397) ──
+//
+// Production's schema is NOT the migration history. The early files here were
+// reconstructed from hand-run scripts and the remote was baselined against
+// them, so `20250401000000_add_updated_at_columns.sql` is recorded as applied
+// on prod while `trg_exercises_updated_at` — which it creates — does not exist
+// there. LIFT-1387's backfill assumed it did, issued a bare
+// `alter table exercises disable trigger trg_exercises_updated_at`, and got
+// SQLSTATE 42704.
+//
+// The blast radius is why this is worth a structural guard. `db push` runs each
+// migration in one transaction, so the failure rolled back the WHOLE file:
+// `bar_weight` stayed NOT NULL while the shipping client had already begun
+// sending `null` for it, and every later schema push queued behind a red job
+// that also gates smoke-test-production and notify-deploy (LIFT-1167). And
+// nothing could see it coming — `migrate-db` is master-only and post-merge, and
+// the scheduled Integration Tests workflow builds its database FROM these
+// files, where the trigger always exists. A static check is the only reader
+// that can be told prod might differ.
+//
+// Scope: statements that fail when an object is ABSENT. The mirror image
+// (`create policy` / `create index` failing when one is PRESENT) is deliberately
+// not enforced — the corpus carries ~40 of them in files already applied, and
+// an applied file's text is inert, so the rule would cost a rewrite of history
+// to buy nothing. This covers what a NEW migration is realistically going to
+// write, which is a data repair reaching for the same trigger suppression.
+describe('Invariant: migrations tolerate an object production may not have (LIFT-1397)', () => {
+  const migrationFiles = readdirSync(MIGRATIONS_DIR)
+    .filter(f => f.endsWith('.sql'))
+    .sort()
+    .map(f => ({ name: f, sql: stripSqlComments(readFileSync(join(MIGRATIONS_DIR, f), 'utf-8')) }))
+
+  /**
+   * Byte ranges of every `$tag$ … $tag$` body — a plpgsql `DO` block or a
+   * function body. Tracked because the guarded form of an absence-intolerant
+   * statement is precisely "inside a block that first asks the catalog", so the
+   * scan has to know which text is inside one.
+   */
+  function dollarQuotedRanges(sql: string): [number, number][] {
+    const ranges: [number, number][] = []
+    const delim = /\$([A-Za-z_][A-Za-z0-9_]*)?\$/g
+    let m: RegExpExecArray | null
+    while ((m = delim.exec(sql)) !== null) {
+      const close = sql.indexOf(m[0], m.index + m[0].length)
+      if (close === -1) break // unbalanced — treat the rest as unquoted
+      ranges.push([m.index, close + m[0].length])
+      delim.lastIndex = close + m[0].length
+    }
+    return ranges
+  }
+
+  /** The `$$…$$` body enclosing `at`, or null when `at` is top-level SQL. */
+  function enclosingBody(sql: string, at: number, ranges: [number, number][]): string | null {
+    for (const [start, end] of ranges) if (at > start && at < end) return sql.slice(start, end)
+    return null
+  }
+
+  /**
+   * Trigger enable/disable statements that would raise 42704 on a database
+   * missing the trigger — i.e. every one NOT inside a block that consults
+   * `pg_trigger` first. `create trigger` is a different statement and is not
+   * matched.
+   */
+  function unguardedTriggerToggles(sql: string): string[] {
+    const ranges = dollarQuotedRanges(sql)
+    const found: string[] = []
+    for (const m of sql.matchAll(/\b(?:enable|disable)\s+(?:always\s+|replica\s+)?trigger\b/gi)) {
+      const body = enclosingBody(sql, m.index!, ranges)
+      if (body && /pg_trigger/i.test(body)) continue
+      found.push(m[0].replace(/\s+/g, ' '))
+    }
+    return found
+  }
+
+  /** Object kinds whose DROP raises rather than no-ops when absent. */
+  const DROPPABLE =
+    'trigger|policy|index|function|procedure|materialized\\s+view|view|table|type|sequence|constraint|extension|schema'
+
+  /** `drop <kind> <name>` statements written without `if exists`. */
+  function unguardedDrops(sql: string): string[] {
+    const re = new RegExp(`\\bdrop\\s+(?:${DROPPABLE})\\s+(?!if\\s+exists\\b)`, 'gi')
+    return [...sql.matchAll(re)].map(m => m[0].replace(/\s+/g, ' ').trim())
+  }
+
+  it('the scan reaches the real trigger statements in the corpus (non-vacuity)', () => {
+    // The bar_weight backfill is the only file that toggles a trigger. If this
+    // stops finding two occurrences, the invariant below has gone vacuous —
+    // either the statements moved or the dollar-quote walker mis-parsed and
+    // swallowed them.
+    const backfill = migrationFiles.find(f => f.name.includes('make_bar_weight_nullable'))
+    expect(backfill).toBeDefined()
+    const toggles = [...backfill!.sql.matchAll(/\b(?:enable|disable)\s+trigger\b/gi)]
+    expect(toggles).toHaveLength(2)
+    // …and both are inside a `$$…$$` body, not at the top level where they
+    // shipped and broke `migrate-db`.
+    const ranges = dollarQuotedRanges(backfill!.sql)
+    for (const t of toggles) expect(enclosingBody(backfill!.sql, t.index!, ranges)).not.toBeNull()
+  })
+
+  it('the scan flags a bare toggle and clears a guarded one (self-test)', () => {
+    expect(unguardedTriggerToggles('alter table t disable trigger trg_x;')).toEqual([
+      'disable trigger',
+    ])
+    // A `$$` block alone is not the guard — asking the catalog is.
+    expect(
+      unguardedTriggerToggles('do $$ begin alter table t disable trigger trg_x; end $$;'),
+    ).toEqual(['disable trigger'])
+    expect(
+      unguardedTriggerToggles(
+        'do $$ begin if exists (select 1 from pg_trigger) then ' +
+          'alter table t disable trigger trg_x; end if; end $$;',
+      ),
+    ).toEqual([])
+    // `create trigger` is a different statement with a different failure mode.
+    expect(unguardedTriggerToggles('create trigger trg_x before update on t;')).toEqual([])
+    expect(unguardedDrops('drop trigger trg_x on t;')).toEqual(['drop trigger'])
+    expect(unguardedDrops('drop trigger if exists trg_x on t;')).toEqual([])
+    // The corpus's real `drop`s are column-constraint clauses, not object drops.
+    expect(unguardedDrops('alter table t alter column c drop default, drop not null;')).toEqual([])
+  })
+
+  it('no migration toggles a trigger without checking pg_trigger first', () => {
+    const violations = migrationFiles.flatMap(({ name, sql }) =>
+      unguardedTriggerToggles(sql).map(
+        stmt =>
+          `${name}: \`${stmt}\` runs unguarded. Postgres raises SQLSTATE 42704 ` +
+          'when the trigger is absent, and production has drifted from this ' +
+          'migration history at least once (LIFT-1397) — that aborts the whole ' +
+          'transaction, so the rest of the file never applies and every later ' +
+          'schema push queues behind a red migrate-db. Wrap it in a `do $$ … $$` ' +
+          'block that checks pg_trigger first.',
+      ),
+    )
+    expect(violations).toEqual([])
+  })
+
+  it('no migration drops a named object without `if exists`', () => {
+    const violations = migrationFiles.flatMap(({ name, sql }) =>
+      unguardedDrops(sql).map(
+        stmt =>
+          `${name}: \`${stmt}…\` assumes the object is there. Add \`if exists\` ` +
+          'so a database whose schema drifted from this history (LIFT-1397) ' +
+          'does not abort the whole migration.',
+      ),
+    )
+    expect(violations).toEqual([])
+  })
+})
+
 // ── Invariant: every RPC the client calls exists in a migration (#1299) ──
 // Guard: an `.rpc('name')` argument is a plain string, so a rename on either
 // side — or a caller added ahead of its migration — typechecks, lints, and
