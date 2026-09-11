@@ -7,7 +7,7 @@ import { usePreferencesStore } from '../stores/preferences'
 import { useProgressionStore } from '../stores/progression'
 import { resetXPCeremony } from '../composables/xpCeremonyUI'
 import { syncQueue } from '../lib/syncQueue'
-import { closeDB } from '../lib/durableStorage'
+import { deleteAllIDB } from '../lib/durableStorage'
 import { logError } from '../lib/logger'
 import { clearReauthFlag } from '../lib/sessionHealth'
 import type { User, Provider } from '@supabase/supabase-js'
@@ -505,21 +505,15 @@ async function deleteAccount(): Promise<void> {
   // on the path where `clear()` threw above.)
   clearGuestFlag()
 
-  // Delete IndexedDB backup database. Close the cached connection first —
-  // deleteDatabase() blocks indefinitely while a connection is still open,
-  // which would otherwise leave the durable backup (and sync journal) on disk.
-  closeDB()
-  if (typeof indexedDB !== 'undefined') {
-    try {
-      const dbs = await indexedDB.databases()
-      for (const db of dbs) {
-        if (db.name) indexedDB.deleteDatabase(db.name)
-      }
-    } catch {
-      // indexedDB.databases() not supported in all browsers — delete known DB
-      try { indexedDB.deleteDatabase('lift-backup') } catch { /* noop */ }
-    }
-  }
+  // Wipe the IndexedDB backup — the workout mirror AND the durable sync
+  // journal. `deleteAllIDB` owns the mechanics (LIFT-1356): it clears the
+  // store's contents first (a transaction is never blocked, so the data goes
+  // even if a second tab holds the database open), closes this tab's cached
+  // connection, and AWAITS each `deleteDatabase` request. The previous code
+  // fired those requests and returned without observing them, so a delete
+  // blocked by another open tab was indistinguishable from one that completed
+  // and the previous user's backup survived on a shared device.
+  await deleteAllIDB()
 
   // Sign out (clears auth session)
   await signOut()

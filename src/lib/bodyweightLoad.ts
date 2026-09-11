@@ -30,6 +30,11 @@
  * A set with no captured bodyweight folds in nothing (degrades to the added
  * weight) rather than guessing, and for every non-bodyweight-loaded exercise the
  * fold is 0 and both directions are the identity.
+ *
+ * The flag also decides the log sheet's weight FLOOR (`isLoggableWeight`,
+ * LIFT-1330): "added nothing" is the ordinary pull-up, so 0 is a value here and
+ * nowhere else. That lived as a hand-rolled `weight > 0` in every gate until it
+ * turned out to block the exact set this module was written for.
  */
 import type { Exercise, WorkoutSet } from '../stores/workout'
 
@@ -47,6 +52,44 @@ export function bodyweightFold(
   if (!exercise?.bodyweightLoaded) return 0
   if (typeof bodyweight !== 'number' || !Number.isFinite(bodyweight) || bodyweight <= 0) return 0
   return bodyweight
+}
+
+/**
+ * Whether an added weight of exactly 0 is a real value for this exercise
+ * (LIFT-1330) — true for a bodyweight-loaded lift, where the field means ADDED
+ * weight and adding nothing is the ordinary case (a plain pull-up), false for
+ * every other exercise, where a 0 lb barbell set says nothing.
+ *
+ * Keyed on the FLAG, not on whether a bodyweight is actually on record. The flag
+ * is the lifter's statement about what the field means; gating entry on a
+ * separate piece of state ("have you ever weighed in?") would disable Save with
+ * nothing on screen explaining why. A missing bodyweight already degrades the
+ * fold to 0 for every *added* weight (see `bodyweightFold`) — the zero case is
+ * not a special one, and the surfaces that need a positive load to say anything
+ * (the 1RM estimate, the to-beat card) hide themselves on the folded total
+ * rather than on this floor.
+ */
+export function allowsZeroWeight(exercise?: Pick<Exercise, 'bodyweightLoaded'> | null): boolean {
+  return exercise?.bodyweightLoaded === true
+}
+
+/**
+ * Is `weight` a value this exercise can log? The single owner of the log
+ * sheet's weight floor, shared by every gate that used to hand-roll
+ * `weight > 0` — the entry gate, the live estimate, the to-beat cards and the
+ * XP preview all have to agree, or Save enables on a value the surfaces above
+ * it refuse to describe.
+ *
+ * Unit-agnostic: this is a floor test, so it holds in display units (the log
+ * sheet's field) and in canonical lbs alike. Upper bounds stay at the call site
+ * — `MAX_WEIGHT` is an input-limit concern, not a load-model one.
+ */
+export function isLoggableWeight(
+  weight: number | null | undefined,
+  exercise?: Pick<Exercise, 'bodyweightLoaded'> | null,
+): boolean {
+  if (typeof weight !== 'number' || !Number.isFinite(weight)) return false
+  return allowsZeroWeight(exercise) ? weight >= 0 : weight > 0
 }
 
 /** The load (in lbs) used for volume + e1RM math on a set. ADDED → EFFECTIVE. */

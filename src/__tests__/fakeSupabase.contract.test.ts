@@ -18,6 +18,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { createFakeSupabase, FAKE_SUPABASE_CHAIN_METHODS, FAKE_NETWORK_ERROR_RESULT } from './fakeSupabase'
+import { columnDefaults } from './migrationSchema'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const storesDir = resolve(here, '../stores')
@@ -186,5 +187,70 @@ describe('createFakeSupabase modes (LIFT-1009)', () => {
     fake.reset()
     expect(fake.tables.sets).toEqual([])
     expect(fake.calls).toEqual([])
+  })
+})
+
+/**
+ * The fake stores what the payload contains — but Postgres does not. A column
+ * the client omits is filled from its DEFAULT, and the next fetch reads that
+ * invented value back as though the user had chosen it. `bar_weight real NOT
+ * NULL DEFAULT 45` handed every kg user a 45 **kg** bar that way, invisibly to
+ * a suite whose double had no notion of a default (LIFT-1387).
+ *
+ * These pin the mechanism itself, so the round-trip regressions built on it
+ * (`syncPipelineIntegration.test.ts`) can't pass for the wrong reason if the
+ * SQL parser breaks.
+ */
+describe('createFakeSupabase applies migration column defaults on insert (LIFT-1387)', () => {
+  it('parses literal defaults out of the migrations and skips function defaults', () => {
+    const exercises = columnDefaults('exercises')
+    // Literals Postgres really would materialize.
+    expect(exercises.get('input_mode')).toBe('numpad')
+    expect(exercises.get('plate_loaded')).toBe(false)
+    expect(exercises.get('bodyweight_loaded')).toBe(false)
+    expect(exercises.get('tags')).toEqual([])
+    expect(exercises.get('gyms')).toEqual([])
+    expect(columnDefaults('sets').get('attempted_next_rep')).toBe(false)
+
+    // `now()` / `gen_random_uuid()` are NOT materialized: inventing an
+    // updated_at here would rewrite the last-write-wins outcome of every sync
+    // test, which is a bigger lie than the one this fixes.
+    expect(exercises.has('updated_at')).toBe(false)
+    expect(exercises.has('created_at')).toBe(false)
+    expect(exercises.has('id')).toBe(false)
+  })
+
+  it('honours a later ALTER COLUMN ... DROP DEFAULT (LIFT-1387)', () => {
+    // 20260404200000 installed `bar_weight ... DEFAULT 45`; 20260909000000
+    // dropped it. Replaying the corpus in order is what makes the fake track
+    // the schema instead of the first statement that mentioned the column.
+    expect(columnDefaults('exercises').has('bar_weight')).toBe(false)
+  })
+
+  it('fills an omitted column on INSERT but leaves an existing row alone on conflict', async () => {
+    const fake = createFakeSupabase({ mode: 'ok' })
+    await fake.from('exercises').upsert({ id: 'ex-1', user_id: 'u1', name: 'Squat' })
+    expect(fake.tables.exercises[0]).toMatchObject({ input_mode: 'numpad', tags: [] })
+
+    // ON CONFLICT DO UPDATE only assigns the columns the payload carries, so a
+    // second upsert must not re-default a value the first one established.
+    await fake.from('exercises').upsert({ id: 'ex-1', user_id: 'u1', name: 'Back Squat' })
+    expect(fake.tables.exercises[0]).toMatchObject({ name: 'Back Squat', input_mode: 'numpad' })
+  })
+
+  it('an explicit value in the payload beats the default, including null', async () => {
+    const fake = createFakeSupabase({ mode: 'ok' })
+    await fake.from('exercises').upsert({
+      id: 'ex-2', user_id: 'u1', name: 'Bench', input_mode: 'plates', bar_weight: null,
+    })
+    expect(fake.tables.exercises[0]).toMatchObject({ input_mode: 'plates', bar_weight: null })
+  })
+
+  it('leaves seeded rows exactly as the test declared them', () => {
+    // `seed()` models rows that already exist server-side; applying defaults
+    // there would silently rewrite every fetch fixture in the suite.
+    const fake = createFakeSupabase({ mode: 'ok' })
+    fake.seed('exercises', [{ id: 'ex-3', user_id: 'u1', name: 'Row' }])
+    expect(fake.tables.exercises[0]).toEqual({ id: 'ex-3', user_id: 'u1', name: 'Row' })
   })
 })

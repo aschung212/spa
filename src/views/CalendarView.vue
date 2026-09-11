@@ -256,28 +256,17 @@
     </div>
   </div>
 
-  <!-- Exercise Picker Modal -->
-  <Teleport to="body">
-    <div v-if="pickerOpen" class="repMaxOverlay" @click.self="closeExercisePicker" @keydown.escape="closeExercisePicker">
-      <div class="repMaxModal" role="dialog" aria-modal="true" aria-labelledby="exercise-picker-title">
-        <h2 id="exercise-picker-title">Choose Exercise</h2>
-        <div class="wtExPickerList">
-          <button
-            v-for="ex in store.exercises"
-            :key="ex.id"
-            class="wtExPickerRow"
-            @click="pickExercise(ex.id)"
-          >
-            <span class="wtExPickerName">{{ ex.name }}</span>
-            <span class="wtChevron">›</span>
-          </button>
-        </div>
-        <div class="repMaxActions">
-          <button class="repMaxBtn repMaxBtnClose" @click="closeExercisePicker">Cancel</button>
-        </div>
-      </div>
-    </div>
-  </Teleport>
+  <!-- Exercise Picker — the SAME component the Workouts tab quick-logs through
+       (LIFT-1375). The inline copy this replaces listed `store.exercises` raw,
+       so an exercise archived one tab away still showed up here. -->
+  <ExercisePickerModal
+    :open="pickerOpen"
+    :exercises="store.activeExercises"
+    title-id="calendar-picker-title"
+    @close="closeExercisePicker"
+    @select="pickExercise"
+    @create-new="createExerciseFromPicker"
+  />
 
   <!-- Log Set Modal -->
   <Teleport to="body">
@@ -287,8 +276,11 @@
         <p class="wtModalSubtitle">{{ formatSelectedDay(logModal.date) }}</p>
 
         <div class="wtInputRow">
+          <!-- "Added" on a bodyweight-loaded exercise, matching the log sheet:
+               the field is the weight on the belt, and 0 is a real value
+               (LIFT-1330). -->
           <label class="repMaxLabel" style="flex:1">
-            Weight ({{ weightUnit }})
+            {{ logModalWeightLabel }} ({{ weightUnit }})
             <div class="repMaxInputRow">
               <input
                 v-model.number="logModal.weight"
@@ -296,7 +288,7 @@
                 inputmode="decimal"
                 min="0"
                 step="any"
-                placeholder="135"
+                :placeholder="logModalWeightPlaceholder"
                 class="repMaxInput"
               />
             </div>
@@ -345,6 +337,9 @@ import { useTagRecovery } from '../composables/useTagRecovery'
 import { useVolumeTrend } from '../composables/useVolumeTrend'
 import { useRepRangeDistribution } from '../composables/useRepRangeDistribution'
 import { useCalendarData } from '../composables/useCalendarData'
+import ExercisePickerModal from '../components/ExercisePickerModal.vue'
+import { allowsZeroWeight, isLoggableWeight } from '../lib/bodyweightLoad'
+import { epley } from '../lib/epley'
 import type { HeatmapDay } from '../components/ConsistencyHeatmap.vue'
 
 const MuscleGroupChart = defineAsyncComponent(() => import('../components/MuscleGroupChart.vue'))
@@ -352,6 +347,11 @@ const MuscleGroupRecovery = defineAsyncComponent(() => import('../components/Mus
 const VolumeTrendChart = defineAsyncComponent(() => import('../components/VolumeTrendChart.vue'))
 const RepRangeChart = defineAsyncComponent(() => import('../components/RepRangeChart.vue'))
 const ConsistencyHeatmap = defineAsyncComponent(() => import('../components/ConsistencyHeatmap.vue'))
+
+const emit = defineEmits<{
+  /** The backfill picker's "+ New exercise" row — routed to the Workouts tab. */
+  (e: 'create-exercise'): void
+}>()
 
 const store = useWorkoutStore()
 const { weightUnit, displayWeight, toLbs } = useWeightUnit()
@@ -709,7 +709,7 @@ function formatSelectedDay(dateStr: string) {
 
 // ── Log modal ─────────────────────────────────────────────────────
 const { isOpen: pickerOpen, open: openPicker, close: closePicker } = useModal({
-  selector: '[aria-labelledby="exercise-picker-title"]',
+  selector: '[aria-labelledby="calendar-picker-title"]',
 })
 // focusContainer: the first field is a number input — focusing the dialog
 // (not the field) lets iOS raise the keyboard on the user's first tap instead
@@ -745,17 +745,59 @@ function closeExercisePicker() {
   closePicker()
 }
 
+/**
+ * "+ New exercise" from the backfill picker. Exercise creation has ONE owner —
+ * the log sheet's new-exercise mode on the Workouts tab, which is also where
+ * tags, gyms, plate mode and bar weight are set — so this hands over rather
+ * than growing a second, thinner creation form here (one interaction path).
+ *
+ * Before LIFT-1375 there was no row at all, so a user with zero exercises who
+ * tapped the week view's "+" got a modal with an empty body and only Cancel:
+ * a dead end reachable straight out of onboarding's "Explore first" path.
+ */
+function createExerciseFromPicker() {
+  closeExercisePicker()
+  emit('create-exercise')
+}
+
+/** The exercise this backfill modal is logging for. */
+const logModalExercise = computed(() =>
+  store.exercises.find(e => e.id === logModal.value.exerciseId),
+)
+
+// Same copy rule as the log sheet: the field means ADDED weight on a
+// bodyweight-loaded exercise, and "135" is a barbell's placeholder.
+const logModalWeightLabel = computed(() =>
+  allowsZeroWeight(logModalExercise.value) ? 'Added' : 'Weight',
+)
+const logModalWeightPlaceholder = computed(() =>
+  allowsZeroWeight(logModalExercise.value) ? '0' : '135',
+)
+
+/**
+ * Estimate for the set being backfilled. Runs the same `epley()` over the same
+ * folded load the store will store (LIFT-834 / #1328) — this surface was still
+ * estimating off the bare field, so a bodyweight-loaded pull-up read ~29 lbs
+ * here against the ~216 `logSet` was about to write. Null rather than 0 when
+ * there is no load at all (added 0 with no bodyweight on record): the row is a
+ * readout, and "0 lbs" is not an estimate.
+ */
 const logModalEstimate = computed(() => {
-  const { weight, reps } = logModal.value
-  if (!weight || weight <= 0 || !reps || reps < 1) return null
-  const w = toLbs(weight)
-  const est = reps === 1 ? w : w * (1 + reps / 30)
-  return displayWeight(Math.round(est))
+  const { weight, reps, exerciseId } = logModal.value
+  if (!isLoggableWeight(weight, logModalExercise.value) || !reps || reps < 1) return null
+  const loadLbs = toLbs(weight!) + store.bodyweightFoldFor(exerciseId)
+  if (loadLbs <= 0) return null
+  return displayWeight(epley(loadLbs, reps))
 })
 
+/**
+ * The backfill path's weight floor. Shares `isLoggableWeight` with the log
+ * sheet (LIFT-1330) so the second entry point can't keep refusing the
+ * pure-bodyweight set the first one now accepts.
+ */
 const canSaveLog = computed(() => {
   const { exerciseId, weight, reps } = logModal.value
-  return exerciseId && weight !== null && weight > 0 && reps !== null && reps >= 1
+  return !!exerciseId && isLoggableWeight(weight, logModalExercise.value) && reps !== null && reps >= 1
 })
 
 function saveLog() {
