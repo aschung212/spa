@@ -49,6 +49,13 @@
  * to re-run: for an lbs device it changes nothing at all, and for a kg device the
  * only value it can touch is the corruption it exists to remove.
  *
+ * Re-running matters because "one-shot" is per DEVICE, not per launch. A guest
+ * (LIFT-1083) never calls `initStores`, so `_userId` stays null, no fetch ever
+ * completes, and the flag below never burns — the `load()` pass therefore runs on
+ * every launch for them. That is deliberate rather than a leak: a guest has no
+ * server and so cannot hold a materialized 45 at all, and the day they sign in,
+ * the pass is still armed for the rows they are about to adopt.
+ *
  * ### Why `updated_at` is deliberately NOT bumped
  *
  * Same reason the migration suppressed the trigger, and the same rule
