@@ -2,7 +2,7 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "trailingSlash": false,
-  "ignoreCommand": "git diff --quiet HEAD^ HEAD -- src/ public/ api/ index.html vite.config.js package.json vercel.json",
+  "ignoreCommand": "git diff --quiet HEAD^ HEAD -- . ':(exclude).github/' ':(exclude).husky/' ':(exclude)LiftApp/' ':(exclude)Screenshots/' ':(exclude)docs/' ':(exclude)e2e/' ':(exclude)scripts/' ':(exclude)supabase/' ':(exclude)test-results/' ':(exclude).coverage-baseline.json' ':(exclude)capacitor.config.ts' ':(exclude)eslint.config.js' ':(exclude)lighthouserc.json' ':(exclude)netlify.toml' ':(exclude)playwright.config.ts' ':(exclude,glob)*.md' ':(exclude,glob)vitest*.config.js'",
   "rewrites": [
     {
       "source": "/((?!assets/|api/|launch/|sw\\.js$|workbox-|sw-offline-handler\\.js$|sw-notification-handler\\.js$|manifest\\.webmanifest$).*)",
