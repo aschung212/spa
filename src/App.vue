@@ -313,6 +313,7 @@ import { guardedReload } from './lib/reloadGuard'
 import { useAuth } from './composables/useAuth'
 import { useAnalytics } from './composables/useAnalytics'
 import { captureAcquisitionSource } from './composables/useAcquisitionSource'
+import { captureRestTimerIntent, requestRestAgain } from './lib/restTimerIntent'
 import { usePreferencesStore } from './stores/preferences'
 import { useWorkoutStore } from './stores/workout'
 import { syncStatus } from './lib/syncQueue'
@@ -574,6 +575,14 @@ function logFromWelcomeBack() {
 // measurable without a backend.
 captureAcquisitionSource()
 
+// ── Rest-timer notification action, cold-boot channel (LIFT-1355) ─────
+// A "Rest Again" tap with no window open launches the app with the action in the
+// URL, because the service worker cannot message a document that has not booted.
+// Capture it here — ahead of the ?tab= cleanup below, which rewrites the URL to
+// the bare pathname — and leave it pending for the rest-timer controller to
+// consume as WorkoutTracker mounts (the same launch URL forces the Workouts tab).
+captureRestTimerIntent()
+
 // ── Tab routing (supports PWA manifest shortcuts via ?tab= param) ─────
 // The scrollable tab-content element, used to preserve per-tab scroll offset.
 const tabContentEl = ref<HTMLElement | null>(null)
@@ -591,6 +600,21 @@ const { activeTab, switchTab } = useTabRouting({
     checkForSWUpdate()
   },
 })
+
+// ── Rest-timer notification action, running-app channel (LIFT-1355) ───
+// The shell owns this listener rather than WorkoutTracker: the tracker only
+// mounts on the Workouts tab, so a message arriving after a relaunch onto
+// Calendar or Weight had nothing listening and the button did nothing. Record
+// the intent and switch to Workouts — that is where the rest timer lives, and
+// the mounting controller consumes what was recorded here (same handoff as the
+// cold-boot URL above).
+function onServiceWorkerMessage(event: MessageEvent) {
+  const data = event.data
+  if (data?.type === 'rest-timer-action' && data.action === 'rest-again') {
+    requestRestAgain()
+    switchTab('workouts')
+  }
+}
 
 // ── Keyboard shortcuts ─────────────────────────────────────────────
 const { helpOpen: shortcutsOpen, toggleHelp: toggleShortcuts, closeHelp: closeShortcuts } = useKeyboardShortcuts(() => [
@@ -766,6 +790,7 @@ onMounted(async () => {
   window.addEventListener('online', updateOnlineStatus)
   window.addEventListener('offline', updateOnlineStatus)
   document.addEventListener('visibilitychange', onBadgeVisibilityChange)
+  navigator.serviceWorker?.addEventListener('message', onServiceWorkerMessage)
   // Re-fetch every store when the connection, the foreground, or the session
   // comes back (LIFT-1226). Without this a failed read stayed stale — and the
   // reconciliation pushes inside each store's fetch stayed parked — until the
@@ -893,6 +918,7 @@ onUnmounted(() => {
   window.removeEventListener('online', updateOnlineStatus)
   window.removeEventListener('offline', updateOnlineStatus)
   document.removeEventListener('visibilitychange', onBadgeVisibilityChange)
+  navigator.serviceWorker?.removeEventListener('message', onServiceWorkerMessage)
   clearAppBadge()
   unsubCrossTab?.()
   teardownSyncRecovery?.()

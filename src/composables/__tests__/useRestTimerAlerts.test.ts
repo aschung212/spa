@@ -92,4 +92,20 @@ describe('useRestTimerAlerts', () => {
     expect(() => a.playWarningBeep(5)).not.toThrow()
     expect(() => a.playGoBeep()).not.toThrow()
   })
+
+  it('degrades to silence when the platform has no AudioContext', () => {
+    // startRestTimer calls ensureAudio, and since LIFT-1355 it can run during
+    // WorkoutTracker's setup (a pending "Rest Again" intent at mount) — where an
+    // escaping error takes down the Workouts tab rather than one event handler.
+    const original = globalThis.AudioContext
+    // @ts-expect-error simulate a platform without Web Audio
+    delete globalThis.AudioContext
+    try {
+      const a = useRestTimerAlerts()
+      expect(() => a.ensureAudio()).not.toThrow()
+      expect(() => a.playGoBeep()).not.toThrow()
+    } finally {
+      globalThis.AudioContext = original
+    }
+  })
 })

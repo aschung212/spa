@@ -48,23 +48,32 @@ export function useRestTimerAlerts(): RestTimerAlerts {
   // ── Audio ───────────────────────────────────────────────────────
   let audioCtx: AudioContext | null = null
 
+  // Beeps are best-effort — both play* helpers below already swallow audio
+  // failures. This one was the exception while being the only one that can
+  // realistically throw (it constructs the context), and LIFT-1355 widened the
+  // blast radius: startRestTimer can now run during WorkoutTracker's setup when a
+  // "Rest Again" intent is pending at mount, where an escaping error takes down
+  // the whole Workouts tab instead of one event handler. Losing the beeps is the
+  // correct degradation; losing the tab is not.
   function ensureAudio() {
-    if (!audioCtx) {
-      audioCtx = new AudioContext()
-    }
-    if (audioCtx.state === 'suspended') {
-      audioCtx.resume()
-    }
-    // Play a short quiet tick to unlock iOS audio on user gesture
-    const osc = audioCtx.createOscillator()
-    const gain = audioCtx.createGain()
-    osc.connect(gain)
-    gain.connect(audioCtx.destination)
-    osc.frequency.value = 1
-    gain.gain.setValueAtTime(0.001, audioCtx.currentTime)
-    gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.05)
-    osc.start(audioCtx.currentTime)
-    osc.stop(audioCtx.currentTime + 0.05)
+    try {
+      if (!audioCtx) {
+        audioCtx = new AudioContext()
+      }
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume()
+      }
+      // Play a short quiet tick to unlock iOS audio on user gesture
+      const osc = audioCtx.createOscillator()
+      const gain = audioCtx.createGain()
+      osc.connect(gain)
+      gain.connect(audioCtx.destination)
+      osc.frequency.value = 1
+      gain.gain.setValueAtTime(0.001, audioCtx.currentTime)
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.05)
+      osc.start(audioCtx.currentTime)
+      osc.stop(audioCtx.currentTime + 0.05)
+    } catch { /* audio not available — beeps degrade to silence */ }
   }
 
   function playWarningBeep(secondsLeft: number) {

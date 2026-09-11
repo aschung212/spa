@@ -1,5 +1,6 @@
-import { ref, computed, watch, onUnmounted, type Ref, type ComputedRef } from 'vue'
+import { ref, computed, watch, type Ref, type ComputedRef } from 'vue'
 import { usePreferencesStore } from '../stores/preferences'
+import { restAgainPending, consumeRestAgain } from '../lib/restTimerIntent'
 import { useNotification, useBackgroundTracker, REST_TIMER_NOTIFICATION_ACTIONS } from './useNotification'
 import { useRestTimer } from './useRestTimer'
 import { useRestTimerPresets } from './useRestTimerPresets'
@@ -174,25 +175,28 @@ export function useRestTimerController(
     startInterval()
   }
 
-  // ── Notification action buttons (LIFT-751) ────────────────────
+  // ── Notification action buttons (LIFT-751 / LIFT-1355) ────────
   // The "Rest Again" button on the completion notification is handled in the
-  // service worker (public/sw-notification-handler.js), which focuses the app and
-  // posts this message. Restart a fresh rest so the user can extend their break
-  // without reopening the log sheet. Respect the user's rest-timer preference: a
-  // lingering notification must not restart a timer the user has since disabled.
-  function handleServiceWorkerMessage(event: MessageEvent) {
-    const data = event.data
-    if (data?.type === 'rest-timer-action' && data.action === 'rest-again' && restTimerEnabled.value) {
-      startRestTimer()
-    }
-  }
-  // Registration and cleanup are paired unconditionally (matching useBackgroundTracker /
-  // useModal) so the listener can never outlive the controller. The controller is only
-  // ever instantiated in WorkoutTracker's setup, so onUnmounted has an owning instance.
-  navigator.serviceWorker?.addEventListener('message', handleServiceWorkerMessage)
-  onUnmounted(() => {
-    navigator.serviceWorker?.removeEventListener('message', handleServiceWorkerMessage)
-  })
+  // service worker (public/sw-notification-handler.js). It reaches the app by
+  // postMessage when a window is already open and by the launch URL after a cold
+  // boot; both land in `restTimerIntent`, so this controller consumes from one
+  // place rather than owning a listener of its own. That matters because the
+  // controller does not exist when the intent arrives on either of the two paths
+  // this fixes — a cold boot, or a relaunch onto the Calendar/Weight tab, where
+  // WorkoutTracker has never mounted. `immediate` covers an intent recorded
+  // before this controller existed; the watcher covers one arriving while it is
+  // mounted, and the watcher is scoped to the owning component so it cannot
+  // outlive it.
+  //
+  // Restart a fresh rest so the user can extend their break without reopening the
+  // log sheet. Respect the user's rest-timer preference: a lingering notification
+  // must not restart a timer the user has since disabled — but consume the intent
+  // either way so it cannot fire on a later mount.
+  watch(restAgainPending, (pending) => {
+    if (!pending) return
+    const fresh = consumeRestAgain()
+    if (fresh && restTimerEnabled.value) startRestTimer()
+  }, { immediate: true })
 
   function togglePause() {
     alerts.ensureAudio()
