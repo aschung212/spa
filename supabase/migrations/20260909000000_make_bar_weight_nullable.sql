@@ -52,13 +52,73 @@ alter table exercises alter column bar_weight drop not null;
 -- the same value the overwhelmingly more likely reading — a materialized
 -- default — is being repaired to.
 --
--- The updated_at trigger is suppressed for the backfill. Bumping every
--- exercise's timestamp would hand the server the win in the next last-write-wins
--- merge for rows where a device still holds an unflushed offline edit, reverting
--- it. The repair does not need the bump: a synced exercise's server `updated_at`
--- is already at or ahead of the local one (the server stamps at write time,
--- after the client's), so the remote row wins the next merge anyway and the
--- cleared value propagates to local state on its own.
-alter table exercises disable trigger trg_exercises_updated_at;
-update exercises set bar_weight = null where bar_weight = 45;
-alter table exercises enable trigger trg_exercises_updated_at;
+-- The updated_at trigger is suppressed for the backfill — WHERE IT EXISTS.
+--
+-- The suppression itself is unchanged in intent: bumping every repaired
+-- exercise's timestamp would hand the server the win in the next
+-- last-write-wins merge for rows where a device still holds an unflushed
+-- offline edit, reverting it.
+--
+-- It is GUARDED because production does not have that trigger (LIFT-1397).
+-- This migration first shipped issuing a bare
+-- `alter table exercises disable trigger trg_exercises_updated_at`, and
+-- `supabase db push` answered SQLSTATE 42704 — "trigger ... does not exist".
+-- `20250401000000_add_updated_at_columns.sql` creates it and prod's migration
+-- history records that file as applied, so prod's SCHEMA HAS DRIFTED FROM THE
+-- HISTORY: those early files were reconstructed from hand-run scripts
+-- ("Original: migration-004-updated-at.sql"), and the columns landed where the
+-- triggers did not. A fresh database built from this directory has the trigger;
+-- the one database that matters does not, and no test can see the difference
+-- (the scheduled Integration Tests workflow builds its DB from these files).
+--
+-- The cost of assuming it was there was not a skipped statement. `db push`
+-- applies each migration in one transaction, so the failure rolled back the
+-- WHOLE file: the column stayed `NOT NULL` while the shipping client had
+-- already begun sending `bar_weight: null` (23502 on every affected upsert,
+-- RESOLVED rather than rejected — LIFT-1321 — so silent), and the red job
+-- wedged every later schema push behind it as well as smoke-test-production
+-- and notify-deploy, which need it (LIFT-1167). The rule this leaves behind:
+-- **a migration may not assume any object it does not itself create.**
+--
+-- Disable, backfill and restore share one `DO` block so the two halves cannot
+-- disagree about what was found. `tgenabled = 'O'` is "enabled the ordinary
+-- way", so a trigger somebody had deliberately disabled is left exactly as it
+-- was found rather than switched on by a data repair.
+--
+-- Residual, stated rather than papered over: if prod carries an updated_at
+-- trigger under some other name, this skips it and the backfill bumps the rows
+-- it repairs. That is a degraded outcome on a narrow set of rows; the bare
+-- statement's outcome was the outage above.
+--
+-- One correction to the note this replaces, which claimed the cleared value
+-- "propagates to local state on its own" because the server's stamp leads the
+-- client's. It does not. `mapRemoteExercise` adopts the server's `updated_at`
+-- verbatim, so a synced row sits at an exact TIE, and `mergeEntities` scores a
+-- tie as a LOCAL win (LIFT-1399) — the device re-upserts the 45 it is still
+-- holding and undoes the repair (LIFT-1398). With no updated_at trigger on
+-- prod that tie is permanent. So this backfill's job is only to stop the server
+-- handing a fresh 45 to the next device that signs in; the client-side repair
+-- in LIFT-1398 is what reaches the devices that already hold one.
+do $$
+declare
+  suppressed boolean := false;
+begin
+  if exists (
+    select 1
+    from pg_trigger
+    where tgrelid = 'public.exercises'::regclass
+      and tgname = 'trg_exercises_updated_at'
+      and not tgisinternal
+      and tgenabled = 'O'
+  ) then
+    alter table public.exercises disable trigger trg_exercises_updated_at;
+    suppressed := true;
+  end if;
+
+  update public.exercises set bar_weight = null where bar_weight = 45;
+
+  if suppressed then
+    alter table public.exercises enable trigger trg_exercises_updated_at;
+  end if;
+end;
+$$;
