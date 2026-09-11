@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url'
 // Chromium and a large tree that would bloat the lockfile and the
 // dependency-review gate for a tool that only ever runs in a browser context.
 // Install them once to run locally (see docs/browser-mode-testing.md):
-//   npm i -D @vitest/browser@^4 playwright@^1.62 && npx playwright install chromium
+//   npm i -D @vitest/browser@^5 playwright@^1.62 && npx playwright install chromium
 //   npm run test:browser
 //
 // Only `**/*.browser.test.ts` files run here; the default happy-dom config

@@ -186,9 +186,16 @@ jobs:
         if: steps.restore-nm.outputs.cache-hit != 'true'
         run: npm ci
 
+      # The blob path is pinned, not left to Vitest's default: v5 moved that
+      # default from `.vitest-reports/` to `.vitest/blob/`, which silently
+      # emptied the upload below and failed the merge in build-and-test. The
+      # upload `path` and build-and-test's `--merge-reports=` must name this
+      # same directory, and `if-no-files-found: error` makes any future drift
+      # fail here, at the shard, instead of two jobs later.
       - name: Run tests (shard ${{ matrix.shardIndex }}/${{ matrix.shardTotal }})
         run: >-
           npx vitest run --coverage --reporter=blob
+          --outputFile.blob=.vitest-reports/blob-${{ matrix.shardIndex }}.json
           --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
           --coverage.thresholds.lines=0
           --coverage.thresholds.statements=0
@@ -202,6 +209,7 @@ jobs:
           name: blob-report-${{ matrix.shardIndex }}
           path: .vitest-reports/*
           include-hidden-files: true
+          if-no-files-found: error
           retention-days: 1
 
   # Rendered-page perf/a11y budget gating against the built dist (LIFT-865).
@@ -445,7 +453,7 @@ jobs:
       # blobs and regenerates coverage/coverage-summary.json (+ coverage-final),
       # enforcing the global thresholds from vitest.config.js on the merged total.
       - name: Merge coverage from shards
-        run: npx vitest run --merge-reports --coverage
+        run: npx vitest run --merge-reports=.vitest-reports --coverage
 
       - name: Coverage ratchet check
         run: node scripts/check-coverage-ratchet.js

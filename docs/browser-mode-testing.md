@@ -40,7 +40,7 @@ lockfile and trip the `dependency-review` PR gate for a tool that only ever
 runs on demand in a browser context. Install them ad hoc:
 
 ```bash
-npm i -D @vitest/browser@^4 playwright@^1.62
+npm i -D @vitest/browser@^5 playwright@^1.62
 npx playwright install chromium
 npm run test:browser
 ```
@@ -52,7 +52,7 @@ npm run test:browser
 ## Version pinning caveat
 
 The `@vitest/browser` major **must** match the installed Vitest major (the repo
-is on Vitest `^4`). The exact compatible patch could not be verified inside the
+is on Vitest `^5`). The exact compatible patch could not be verified inside the
 network-restricted overnight builder loop, so `test:browser` was authored but
 not executed there. Run it once locally to confirm the resolved versions before
 relying on it in CI.
@@ -78,7 +78,7 @@ dedicated PR-only job that reuses the existing Playwright browser cache from the
         with:
           path: node_modules
           key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
-      - run: npm i -D @vitest/browser@^4 playwright@^1.62 --no-save
+      - run: npm i -D @vitest/browser@^5 playwright@^1.62 --no-save
       - run: npx playwright install --with-deps chromium
       - run: npm run test:browser
 ```
