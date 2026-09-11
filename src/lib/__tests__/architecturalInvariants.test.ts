@@ -20,6 +20,7 @@ import { readFileSync, readdirSync } from 'fs'
 import { join, relative, resolve } from 'path'
 import { fileURLToPath } from 'url'
 import { dirname } from 'path'
+import { notNullColumns } from '../../__tests__/migrationSchema'
 
 // ── Shared helpers ──────────────────────────────────────────────────
 
@@ -1371,6 +1372,136 @@ describe('Invariant: REPLAYABLE_COLUMNS stays in lockstep with its producers (LI
       const allowed = allowlistFor(table)
       for (const col of columnKeys(blockAfter(source, marker))) {
         if (!allowed.has(col)) violations.push(`${table}.${col} (sent by ${marker})`)
+      }
+    }
+    expect(violations).toEqual([])
+  })
+})
+
+// ── Invariant: an always-send `?? null` column is nullable in SQL (LIFT-1387) ──
+
+describe('Invariant: every always-send NULL column is nullable in the migrations (LIFT-1387)', () => {
+  /**
+   * `_buildExerciseUpsert` sends most of its columns unconditionally, using
+   * `?? null` to mean "the user cleared this / never set it". That only works
+   * if the column can actually hold a NULL — otherwise every exercise write
+   * fails with SQLSTATE 23502, and it fails as a RESOLVED `{ error }` rather
+   * than a rejection (LIFT-1321), so nothing throws and the local-first UI
+   * shows the write as saved.
+   *
+   * `bar_weight` reached that shape in LIFT-1387: it had to become nullable in
+   * the same commit that started sending `null` for it, because its
+   * `NOT NULL DEFAULT 45` was what invented a 45 **kg** bar for every kg user
+   * in the first place. The two halves are one change, and this is what keeps
+   * them one change — a revert of either side alone fails here.
+   *
+   * The fake Supabase models column DEFAULTs but not NOT NULL constraints
+   * (teaching it those would reject half the suite's partial-payload fixtures
+   * for unrelated reasons), so a static check is the guard that fits. It is
+   * derived from both sources: the payload's `?? null` columns come out of the
+   * store, the nullability out of the migration corpus, and neither is listed
+   * here.
+   */
+  const WORKOUT_STORE_SRC = readFileSync(join(STORES_DIR, 'workout.ts'), 'utf-8')
+
+  /**
+   * The first balanced `{`…`}` block following `marker` ('' if absent).
+   *
+   * `at` re-anchors the search inside the marker's region, which is required
+   * rather than decorative: `_enqueueSetUpsert` destructures a typed parameter,
+   * so the first `{` after its name opens the PARAMETER TYPE, not the row
+   * literal — a scan that took it would quietly cover the wrong block and
+   * report clean.
+   */
+  function bodyAfter(source: string, marker: string, at = '{'): string {
+    const start = source.indexOf(marker)
+    if (start === -1) return ''
+    const anchor = source.indexOf(at, start + marker.length)
+    if (anchor === -1) return ''
+    const from = source.indexOf('{', anchor)
+    if (from === -1) return ''
+    let depth = 0
+    for (let i = from; i < source.length; i++) {
+      if (source[i] === '{') depth++
+      else if (source[i] === '}' && --depth === 0) return source.slice(from, i + 1)
+    }
+    return ''
+  }
+
+  /**
+   * Columns a producer sends as `col: <expr> ?? null`.
+   *
+   * Scanned per LINE rather than with one expression spanning the payload:
+   * every column in these row literals is its own line, and a line-anchored
+   * match can't be thrown off by a comma or brace inside the value expression
+   * (`foo: pick(a, b) ?? null`). A guard that silently stops seeing a column is
+   * worse than no guard.
+   */
+  function nullableSendColumns(source: string, marker: string, at?: string): string[] {
+    const cols: string[] = []
+    for (const line of stripComments(bodyAfter(source, marker, at)).split('\n')) {
+      const m = line.match(/^\s*([a-z_][a-z0-9_]*)\s*:.*\?\?\s*null\s*,?\s*$/)
+      if (m) cols.push(m[1])
+    }
+    return cols
+  }
+
+  /** Every table→producer pair whose upsert payload the client owns. */
+  const PRODUCERS = [
+    { table: 'exercises', marker: 'function _buildExerciseUpsert', at: 'return {' },
+    { table: 'sets', marker: 'function _enqueueSetUpsert', at: 'const row = {' },
+  ] as const
+
+  it('the scan reaches each producer’s real row literal (non-vacuity)', () => {
+    // Every column the producers send, `?? null` or not — proves `bodyAfter`
+    // landed on the row literal rather than on a parameter type or an empty
+    // string, for BOTH producers. Without this the sets half would report clean
+    // while scanning `{ id: string; date: string; … }`.
+    const lines = (marker: string, at: string) =>
+      stripComments(bodyAfter(WORKOUT_STORE_SRC, marker, at))
+    expect(lines('function _buildExerciseUpsert', 'return {')).toContain('plate_count_mode')
+    expect(lines('function _enqueueSetUpsert', 'const row = {')).toContain('estimated_1rm')
+    // …and specifically NOT the destructured parameter type the naive anchor
+    // would have hit, whose declarations are the only `id: string` in scope.
+    expect(lines('function _enqueueSetUpsert', 'const row = {')).not.toContain('id: string')
+    expect(bodyAfter(WORKOUT_STORE_SRC, 'function _enqueueSetUpsert')).toContain('id: string')
+  })
+
+  it('the scan finds the exercise upsert’s NULL-sending columns (non-vacuity)', () => {
+    const cols = nullableSendColumns(WORKOUT_STORE_SRC, 'function _buildExerciseUpsert', 'return {')
+    // Anchors that must be present however the payload is spelled — if the
+    // extractor silently stopped matching, the invariant below would pass by
+    // scanning nothing.
+    expect(cols).toContain('bar_weight')
+    expect(cols).toContain('archived_at')
+    expect(cols).toContain('notes')
+    expect(cols.length).toBeGreaterThanOrEqual(5)
+    // Columns that default to something OTHER than null must not be swept in.
+    expect(cols).not.toContain('gyms')
+    expect(cols).not.toContain('bodyweight_loaded')
+  })
+
+  it('the scan reads nullability out of the migrations (non-vacuity)', () => {
+    // `name` is NOT NULL from the initial schema and nothing has relaxed it;
+    // `bar_weight` was NOT NULL until LIFT-1387 relaxed it.
+    expect(notNullColumns('exercises').has('name')).toBe(true)
+    expect(notNullColumns('exercises').has('bar_weight')).toBe(false)
+    expect(notNullColumns('sets').has('estimated_1rm')).toBe(true)
+  })
+
+  it('no column sent as `?? null` is declared NOT NULL', () => {
+    const violations: string[] = []
+    for (const { table, marker, at } of PRODUCERS) {
+      const notNull = notNullColumns(table)
+      for (const col of nullableSendColumns(WORKOUT_STORE_SRC, marker, at)) {
+        if (!notNull.has(col)) continue
+        violations.push(
+          `${marker} sends ${table}.${col} as \`?? null\`, but the migrations ` +
+            'declare it NOT NULL. Postgres answers that with SQLSTATE 23502, ' +
+            'which postgrest-js RESOLVES as { error } rather than rejecting — ' +
+            'so every write through this producer fails silently. Relax the ' +
+            'column in a migration in the same commit.',
+        )
       }
     }
     expect(violations).toEqual([])

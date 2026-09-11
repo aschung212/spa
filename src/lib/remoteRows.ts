@@ -85,6 +85,11 @@ export function mapRemoteExercise(row: Tables<'exercises'>): Exercise & { update
   if (row.input_mode === 'numpad' || row.input_mode === 'plates') {
     exercise.inputMode = row.input_mode
   }
+  // A null `bar_weight` means "no explicit bar" and must stay ABSENT here, so
+  // the caller falls through to the unit-aware `defaultBarWeight` (LIFT-1211).
+  // The column carried a `NOT NULL DEFAULT 45` until LIFT-1387, so this branch
+  // was taken for every synced row and a kg user's untouched exercise adopted a
+  // 45 kg (99 lb) bar it had never been given.
   if (isFiniteNumber(row.bar_weight)) exercise.barWeight = row.bar_weight
   if (row.plate_count_mode === 'per-side' || row.plate_count_mode === 'total') {
     exercise.plateCountMode = row.plate_count_mode
