@@ -256,7 +256,9 @@ disclosure work must ship in the **same PR as the UI** (CLAUDE.md Documentation 
   `coach_global_spend`, `coach_usage_log`, `coach_consent`, and the `SECURITY DEFINER` RPCs
   (`claim_coach_request`, `record_coach_usage`, `record_coach_consent`, `delete_coach_data`).
 - `vercel.json` `ignoreCommand` now includes `api/` and `vercel.json` (else a function-only
-  change ships green in CI and 404s in prod).
+  change ships green in CI and 404s in prod). *(That list became a denylist in LIFT-1354 —
+  it now names the paths that DON'T deploy. Both of these stay deployable, by not being
+  excluded rather than by being listed.)*
 - `src/lib/coachDigest.ts` — pure payload builder (`buildCoachPayload`) mirroring
   `buildSessionSummary`: full per-set log windowed to ~16 weeks (`setDayKey`-bucketed),
   lifetime PRs, per-set relative intensities, current-week volume, consistency, bodyweight
