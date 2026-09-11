@@ -31,6 +31,7 @@ interface MockExercise {
   tags: string[]
   sets: MockSet[]
   bodyweightLoaded?: boolean
+  archived_at?: string | null
 }
 
 // The lifter's tracked bodyweight, as the real store's `_currentBodyweight()`
@@ -64,6 +65,9 @@ vi.mock('../../stores/workout', () => ({
   useWorkoutStore: () => ({
     get exercises() { return exercises },
     set exercises(v: MockExercise[]) { exercises = v },
+    // Derived exactly as the real store derives it, so the picker can't pass
+    // here while leaking archived rows in the app (LIFT-1375).
+    get activeExercises() { return exercises.filter(e => !e.archived_at) },
     get allTags() { return getAllTags() },
     getExercisePR,
     bodyweightFoldFor,
@@ -82,6 +86,13 @@ function mountCalendar() {
       stubs: { Teleport: true },
     }
   })
+}
+
+// The local day key the calendar renders as "today" — built the same way the
+// existing specs build theirs, never via toISOString() (#746).
+function todayKey(): string {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
 // Create exercise data with sets on specific dates
@@ -595,9 +606,9 @@ describe('CalendarView', () => {
 
       const dialog = wrapper.find('[role="dialog"]')
       expect(dialog.exists()).toBe(true)
-      expect(dialog.attributes('aria-labelledby')).toBe('exercise-picker-title')
-      expect(wrapper.find('#exercise-picker-title').exists()).toBe(true)
-      expect(wrapper.find('#exercise-picker-title').text()).toBe('Choose Exercise')
+      expect(dialog.attributes('aria-labelledby')).toBe('calendar-picker-title')
+      expect(wrapper.find('#calendar-picker-title').exists()).toBe(true)
+      expect(wrapper.find('#calendar-picker-title').text()).toBe('Choose Exercise')
     })
 
     it('week view log buttons have aria-labels', async () => {
@@ -855,6 +866,84 @@ describe('CalendarView', () => {
         const wrapper = await expandTodaysSets()
         expect(wrapper.find('.calSetWeight').text()).toBe('185 lbs')
       })
+    })
+  })
+
+  /**
+   * The backfill picker used to be a hand-rolled copy of ExercisePickerModal
+   * that had drifted from it in two user-visible ways (LIFT-1375): it listed
+   * `store.exercises` raw, so an exercise archived on the Workouts tab still
+   * showed up here, and it had no "+ New exercise" row, so a user with none
+   * got a modal with an empty body and only Cancel.
+   */
+  describe('backfill exercise picker (LIFT-1375)', () => {
+    const TODAY = todayKey()
+
+    async function openPicker() {
+      const wrapper = mountCalendar()
+      await wrapper.find('.calCellToday').trigger('click')
+      await wrapper.find('.calLogBtn').trigger('click')
+      return wrapper
+    }
+
+    const pickerNames = (wrapper: ReturnType<typeof mountCalendar>) =>
+      wrapper.findAll('.wtExPickerRow').map(b => b.text())
+
+    it('omits an exercise archived on the Workouts tab', async () => {
+      exercises = [
+        { id: 'ex-1', name: 'Bench Press', tags: ['Chest'], sets: [] },
+        { id: 'ex-2', name: 'Retired Machine Press', tags: ['Chest'], sets: [], archived_at: '2026-01-01T00:00:00Z' },
+      ]
+      const wrapper = await openPicker()
+
+      expect(pickerNames(wrapper).some(t => t.includes('Bench Press'))).toBe(true)
+      expect(pickerNames(wrapper).some(t => t.includes('Retired Machine Press'))).toBe(false)
+    })
+
+    // Archiving hides an exercise from the pickers, not from history — the
+    // calendar grid must keep rendering the sets it already holds.
+    it('still shows an archived exercise\'s logged sets in the day detail', async () => {
+      exercises = [{
+        id: 'ex-2',
+        name: 'Retired Machine Press',
+        tags: ['Chest'],
+        archived_at: '2026-01-01T00:00:00Z',
+        sets: [{ id: 's-1', date: `${TODAY}T12:00:00`, weight: 185, reps: 5, estimated1RM: 216 }],
+      }]
+      const wrapper = mountCalendar()
+      await wrapper.find('.calCellToday').trigger('click')
+
+      expect(wrapper.find('.calExList').text()).toContain('Retired Machine Press')
+    })
+
+    // The dead end: zero exercises meant an empty list and a Cancel button.
+    it('offers a way forward when the user has no exercises at all', async () => {
+      exercises = []
+      const wrapper = await openPicker()
+
+      const rows = wrapper.findAll('.wtExPickerRow')
+      expect(rows.length).toBe(1)
+      expect(rows[0].text()).toContain('+ New exercise')
+    })
+
+    // Creation has one owner (the log sheet's new-exercise mode), so the
+    // calendar hands the intent over rather than growing a second form.
+    it('emits create-exercise and closes the picker on "+ New exercise"', async () => {
+      exercises = []
+      const wrapper = await openPicker()
+      await wrapper.find('.wtExPickerNew').trigger('click')
+
+      expect(wrapper.emitted('create-exercise')).toHaveLength(1)
+      expect(wrapper.find('[aria-labelledby="calendar-picker-title"]').exists()).toBe(false)
+    })
+
+    it('still opens the log modal for a picked exercise', async () => {
+      exercises = [{ id: 'ex-1', name: 'Bench Press', tags: ['Chest'], sets: [] }]
+      const wrapper = await openPicker()
+      await wrapper.findAll('.wtExPickerRow').find(b => b.text().includes('Bench Press'))!.trigger('click')
+
+      expect(wrapper.find('[aria-labelledby="cal-modal-title"]').exists()).toBe(true)
+      expect(wrapper.find('#cal-modal-title').text()).toBe('Bench Press')
     })
   })
 })

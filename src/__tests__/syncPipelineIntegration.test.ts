@@ -64,6 +64,7 @@ import {
   _getCircuitBreakerState,
 } from '../lib/syncQueue'
 import { isTombstoned, _resetTombstones } from '../lib/tombstones'
+import { defaultBarWeight, weightToPlates, KG_PLATES } from '../lib/plateCalculator'
 
 const localStorageMock = getLocalStorageMock()
 // Flush pending timers + the microtask chains the real queue kicks off. Driven
@@ -405,6 +406,75 @@ describe('Sync Pipeline Integration (LIFT-654 / LIFT-1010)', () => {
 
       const ex = store.exercises.find(e => e.id === 'ex-pcm')
       expect(ex?.plateCountMode).toBe('total')
+    })
+  })
+
+  // ── bar weight: "no explicit bar" must survive the round trip (LIFT-1387) ──
+  // Regression: `_buildExerciseUpsert` OMITTED bar_weight when the user had set
+  // none, so Postgres applied the column's `NOT NULL DEFAULT 45` on insert and
+  // the fetch adopted it. `Exercise.barWeight` lives in the DISPLAY unit
+  // (LIFT-1211), so a kg user's untouched exercise came back holding a 45 **kg**
+  // bar — 99 lb — and `defaultBarWeight('kg')` became unreachable for that row.
+  //
+  // Nothing caught it because every fixture in this file supplies an explicit
+  // barWeight, so the branch where the column default fills the gap was never
+  // taken — the sync-path twin of the client-side blind spot CLAUDE.md already
+  // names for LIFT-1211. The fake applies no defaults either, until LIFT-1387
+  // taught it to derive them from the migrations.
+  describe('bar weight column default (LIFT-1387)', () => {
+    it('a plate exercise with no explicit bar round-trips with barWeight still absent', async () => {
+      const store = useWorkoutStore()
+      await store.init(TEST_USER)
+      const exerciseId = store.addExercise('Squat', ['Legs'])!
+      // Turning on plate mode is the whole interaction — the bar is never set,
+      // which is the case the unit-aware fallback exists for.
+      store.setExerciseInputMode(exerciseId, 'plates')
+      await tick()
+
+      // The payload says "no bar" explicitly instead of leaving the column's
+      // own default to answer on the user's behalf.
+      const upserts = fakeSupabase.upsertsFor('exercises')
+      const payload = upserts[upserts.length - 1].data as Record<string, unknown>
+      expect(payload).toHaveProperty('bar_weight', null)
+
+      // Read it back the way a second device (or a reinstall) does.
+      localStorageMock.clear()
+      setActivePinia(createPinia())
+      const fresh = useWorkoutStore()
+      await fresh.init(TEST_USER)
+
+      const ex = fresh.exercises.find(e => e.id === exerciseId)!
+      expect(ex.inputMode).toBe('plates')
+      expect(ex.barWeight).toBeUndefined()
+
+      // The fallback that absence restores is unit-aware, and the difference is
+      // not cosmetic: a 100 kg target is 40/side on the real 20 kg bar and
+      // 27.5/side against the 45 the column used to invent. BOTH decompose
+      // cleanly, so a wrong bar surfaces as a confidently wrong load with no
+      // null, no empty state, and nothing on screen to question.
+      const bar = ex.barWeight ?? defaultBarWeight('kg')
+      expect(bar).toBe(20)
+      expect(weightToPlates(100, bar, KG_PLATES)).toEqual([20, 20])
+      expect(weightToPlates(100, 45, KG_PLATES)).toEqual([20, 5, 2.5])
+    })
+
+    it('still round-trips a bar the user did set', async () => {
+      const store = useWorkoutStore()
+      await store.init(TEST_USER)
+      const exerciseId = store.addExercise('Bench Press', ['Push'])!
+      store.setExerciseInputMode(exerciseId, 'plates')
+      store.setExerciseBarWeight(exerciseId, 15)
+      await tick()
+
+      const upserts = fakeSupabase.upsertsFor('exercises')
+      const payload = upserts[upserts.length - 1].data as Record<string, unknown>
+      expect(payload).toHaveProperty('bar_weight', 15)
+
+      localStorageMock.clear()
+      setActivePinia(createPinia())
+      const fresh = useWorkoutStore()
+      await fresh.init(TEST_USER)
+      expect(fresh.exercises.find(e => e.id === exerciseId)!.barWeight).toBe(15)
     })
   })
 
