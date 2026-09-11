@@ -21,6 +21,8 @@ interface MockSet {
   weight: number
   reps: number
   estimated1RM: number
+  /** The bodyweight captured at log time (LIFT-834) — local-only, per set. */
+  bodyweight?: number
 }
 
 interface MockExercise {
@@ -801,6 +803,69 @@ describe('CalendarView', () => {
 
       expect(saveBtn(wrapper).attributes('disabled')).toBeDefined()
       expect(fields(wrapper).weight.attributes('placeholder')).toBe('135')
+    })
+
+    /**
+     * LIFT-1373 — the day's set rows are a history read-back surface, and they
+     * render the load right beside the folded e1RM. A pure-bodyweight set read
+     * "0 lbs x 12 reps ~238 lbs e1RM": the same row saying the lifter moved
+     * nothing and estimating a 238 lb max.
+     */
+    describe('set rows read the load in ADDED-space words', () => {
+      function seedPullUpDay(weight: number, bodyweight?: number) {
+        const today = new Date()
+        const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
+        exercises = [{
+          id: 'ex-1',
+          name: 'Pull-Up',
+          tags: ['Back'],
+          bodyweightLoaded: true,
+          sets: [{
+            id: 's-1',
+            date: `${dateStr}T12:00:00`,
+            weight,
+            reps: 12,
+            estimated1RM: epley((bodyweight ?? 0) + weight, 12),
+            ...(bodyweight === undefined ? {} : { bodyweight }),
+          }],
+        }]
+      }
+
+      async function expandTodaysSets() {
+        const wrapper = mountCalendar()
+        await wrapper.find('.calCellToday').trigger('click')
+        await wrapper.find('.calExRow').trigger('click')
+        return wrapper
+      }
+
+      it('reads a pure-bodyweight set as "Bodyweight", not "0 lbs"', async () => {
+        seedPullUpDay(0, BODYWEIGHT)
+        const wrapper = await expandTodaysSets()
+        expect(wrapper.find('.calSetWeight').text()).toBe('Bodyweight')
+        expect(wrapper.find('.calSetMain').text()).not.toContain('0 lbs')
+      })
+
+      it('marks an added weight as added', async () => {
+        seedPullUpDay(25, BODYWEIGHT)
+        const wrapper = await expandTodaysSets()
+        expect(wrapper.find('.calSetWeight').text()).toBe('+25 lbs')
+      })
+
+      it('keeps "0 lbs" for a set that folded nothing in', async () => {
+        // No captured bodyweight, so the neighbouring e1RM is off the bare
+        // weight — "Bodyweight" would contradict it.
+        seedPullUpDay(0, undefined)
+        const wrapper = await expandTodaysSets()
+        expect(wrapper.find('.calSetWeight').text()).toBe('0 lbs')
+      })
+
+      it('leaves an ordinary barbell set exactly as it was', async () => {
+        const today = new Date()
+        const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
+        exercises = makeExercises([dateStr])
+        const wrapper = await expandTodaysSets()
+        expect(wrapper.find('.calSetWeight').text()).toBe('185 lbs')
+      })
     })
   })
 

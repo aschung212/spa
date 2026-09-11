@@ -45,7 +45,7 @@
             @click="toggleSetActions(entry.set.id)"
           >
             <span class="wtTimelineExName">{{ entry.exerciseName }}</span>
-            <span class="wtTimelineSetDetail">{{ displayWeight(entry.set.weight) }} {{ weightUnit }} × {{ entry.set.reps }}</span>
+            <span class="wtTimelineSetDetail">{{ setLoad(entry) }} × {{ entry.set.reps }}</span>
             <span
               v-if="entry.set.attemptedNextRep"
               class="wtEffortBadge"
@@ -74,6 +74,7 @@ import { ref, computed } from 'vue'
 import type { Exercise, WorkoutSet } from '../stores/workout'
 import { useWeightUnit } from '../composables/useWeightUnit'
 import { buildWarmupSetIds } from '../lib/classifyWarmupSets'
+import { formatSetLoad } from '../lib/bodyweightLoad'
 import { setDayKey, formatShortDate } from '../lib/dates'
 
 const props = defineProps<{
@@ -115,6 +116,13 @@ const timelineLimit = ref(50)
 interface TimelineEntry {
   exerciseId: string
   exerciseName: string
+  /**
+   * LIFT-1373: the row flattens its set away from the exercise, so the
+   * bodyweight-loaded flag has to be threaded onto the entry or the load
+   * cannot be described in ADDED-space words (the shape #1333 used for
+   * `SetWithExercise.effectiveWeight`).
+   */
+  bodyweightLoaded: boolean
   set: WorkoutSet
 }
 
@@ -122,11 +130,29 @@ const timelineSets = computed((): TimelineEntry[] => {
   const entries: TimelineEntry[] = []
   for (const ex of props.exercises) {
     for (const s of ex.sets) {
-      entries.push({ exerciseId: ex.id, exerciseName: ex.name, set: s })
+      entries.push({
+        exerciseId: ex.id,
+        exerciseName: ex.name,
+        bodyweightLoaded: ex.bodyweightLoaded === true,
+        set: s,
+      })
     }
   }
   return entries.sort((a, b) => setDayKey(b.set.date).localeCompare(setDayKey(a.set.date)))
 })
+
+/**
+ * The set's load in the words the app uses for it — "Bodyweight", "+25 lbs",
+ * "135 lbs" (LIFT-1373). Shared by the visible row text and its accessible
+ * name so the two cannot disagree about what the number means.
+ */
+function setLoad(entry: TimelineEntry): string {
+  return formatSetLoad(
+    entry.set,
+    { bodyweightLoaded: entry.bodyweightLoaded },
+    { displayWeight, unit: weightUnit.value },
+  )
+}
 
 // PR badge map: for each set, determine if it's the best e1RM (weight PR)
 // or the best reps at its weight (rep PR) for that exercise.
@@ -189,7 +215,7 @@ const visibleTimelineGroups = computed(() => {
 function setRowLabel(entry: TimelineEntry): string {
   const parts = [
     entry.exerciseName,
-    `${displayWeight(entry.set.weight)} ${weightUnit.value} × ${entry.set.reps}`,
+    `${setLoad(entry)} × ${entry.set.reps}`,
   ]
   // The badge spans carry their own aria-labels, but a child's label does not
   // reach a parent that has one of its own — so restate them here or they are

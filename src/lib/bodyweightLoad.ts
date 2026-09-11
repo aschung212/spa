@@ -92,6 +92,74 @@ export function isLoggableWeight(
   return allowsZeroWeight(exercise) ? weight >= 0 : weight > 0
 }
 
+/**
+ * How a set's load reads back in ADDED-space words (LIFT-1373).
+ *
+ * Every history surface used to render `set.weight` bare — so a pure-bodyweight
+ * set (added = 0, the ordinary pull-up LIFT-1330 finally made typeable) read
+ * "0 lbs × 12" beside an e1RM computed off the folded load. One row said the
+ * lifter moved nothing and, two spans later, that they estimate a 224 lb max.
+ * Rendering the added portion bare re-asserts the thing the flag exists to
+ * deny, on the one row where the added portion is zero and the load is entirely
+ * the lifter: a reader cannot tell "no plates" from "no data".
+ *
+ * Keyed on the fold ACTUALLY APPLIED, not on the flag alone. A set logged
+ * before the flag was turned on (or by a lifter who has never weighed in) folds
+ * in nothing — its stored e1RM is off the bare weight — so it must keep reading
+ * "0 lbs" rather than claiming a bodyweight it never recorded. The label
+ * therefore always describes exactly what the neighbouring e1RM was computed
+ * from.
+ *
+ * This is one formatter rather than a phrase per call site because the visible
+ * text and the `aria-label` are separate strings at every one of them, and the
+ * two drift (LIFT-1349 nearly split `WorkoutTimeline`'s pair). Callers append
+ * their own "× N" / "× N reps" suffix — that part already differs by surface.
+ */
+export interface SetLoadFormat {
+  /** lbs → the number shown in the user's unit (`useWeightUnit().displayWeight`). */
+  displayWeight: (lbs: number) => number
+  /** The display unit's label — `'lbs'` or `'kg'`. */
+  unit: string
+}
+
+export interface SetLoadParts {
+  /** The load itself — `'135'`, `'+25'`, or the whole word `'Bodyweight'`. */
+  value: string
+  /** The unit to follow it with, or null when the value is already a phrase. */
+  unit: string | null
+}
+
+/**
+ * {@link formatSetLoad} split into its parts, for the one surface that styles
+ * the unit separately from the number (the PR card's smaller, dimmer `lbs`).
+ * Both shapes come from this single decision so a card and a row can never
+ * disagree about whether a set was bodyweight-only.
+ */
+export function setLoadParts(
+  set: Pick<WorkoutSet, 'weight'> & { bodyweight?: number },
+  exercise: Pick<Exercise, 'bodyweightLoaded'> | null | undefined,
+  { displayWeight, unit }: SetLoadFormat,
+): SetLoadParts {
+  const fold = bodyweightFold(exercise, set.bodyweight)
+  // No fold applied: the stored weight IS the whole load, so say it plainly.
+  if (fold <= 0) return { value: String(displayWeight(set.weight)), unit }
+  // Added nothing — the load is the lifter. Matches the log sheet's own
+  // "Bodyweight × N" to-beat card, so the suggestion and the row it becomes
+  // are worded the same.
+  if (set.weight === 0) return { value: 'Bodyweight', unit: null }
+  // A "+" marks the number as the added portion rather than the load.
+  return { value: `${set.weight > 0 ? '+' : ''}${displayWeight(set.weight)}`, unit }
+}
+
+export function formatSetLoad(
+  set: Pick<WorkoutSet, 'weight'> & { bodyweight?: number },
+  exercise: Pick<Exercise, 'bodyweightLoaded'> | null | undefined,
+  format: SetLoadFormat,
+): string {
+  const { value, unit } = setLoadParts(set, exercise, format)
+  return unit ? `${value} ${unit}` : value
+}
+
 /** The load (in lbs) used for volume + e1RM math on a set. ADDED → EFFECTIVE. */
 export function effectiveSetWeight(
   set: Pick<WorkoutSet, 'weight'> & { bodyweight?: number },

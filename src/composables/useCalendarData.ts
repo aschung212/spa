@@ -11,6 +11,12 @@ export interface DaySummary {
 
 export interface CalendarSet extends WorkoutSet {
   isPR: boolean
+  /**
+   * LIFT-1373: the row is looked up by exercise NAME and rendered without the
+   * exercise, so the bodyweight-loaded flag has to ride along or the load
+   * cannot be described in ADDED-space words.
+   */
+  bodyweightLoaded: boolean
 }
 
 export interface UseCalendarDataOptions {
@@ -142,7 +148,11 @@ export function useCalendarData(options: UseCalendarDataOptions): UseCalendarDat
     return exercise.sets
       .filter(s => s.date.slice(0, 10) === dayStr)
       .sort((a, b) => b.estimated1RM - a.estimated1RM)
-      .map(s => ({ ...s, isPR: isPRDay && s.estimated1RM === pr }))
+      .map(s => ({
+        ...s,
+        isPR: isPRDay && s.estimated1RM === pr,
+        bodyweightLoaded: exercise.bodyweightLoaded === true,
+      }))
   }
 
   function getSetCount(dateStr: string, exName: string): number {

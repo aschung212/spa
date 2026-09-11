@@ -144,7 +144,7 @@
                 >
                   <span class="calSetMain">
                     <span v-if="s.isPR" class="calSetPR">🏆</span>
-                    <span class="calSetWeight">{{ displayWeight(s.weight) }} {{ weightUnit }}</span>
+                    <span class="calSetWeight">{{ setLoad(s) }}</span>
                     <span class="calSetSep">×</span>
                     <span class="calSetReps">{{ s.reps }} reps</span>
                   </span>
@@ -197,7 +197,7 @@
                 >
                   <span class="calSetMain">
                     <span v-if="s.isPR" class="calSetPR">🏆</span>
-                    <span class="calSetWeight">{{ displayWeight(s.weight) }} {{ weightUnit }}</span>
+                    <span class="calSetWeight">{{ setLoad(s) }}</span>
                     <span class="calSetSep">×</span>
                     <span class="calSetReps">{{ s.reps }} reps</span>
                   </span>
@@ -336,9 +336,9 @@ import { useTagVolumeTrend } from '../composables/useTagVolumeTrend'
 import { useTagRecovery } from '../composables/useTagRecovery'
 import { useVolumeTrend } from '../composables/useVolumeTrend'
 import { useRepRangeDistribution } from '../composables/useRepRangeDistribution'
-import { useCalendarData } from '../composables/useCalendarData'
+import { useCalendarData, type CalendarSet } from '../composables/useCalendarData'
 import ExercisePickerModal from '../components/ExercisePickerModal.vue'
-import { allowsZeroWeight, isLoggableWeight } from '../lib/bodyweightLoad'
+import { allowsZeroWeight, formatSetLoad, isLoggableWeight } from '../lib/bodyweightLoad'
 import { epley } from '../lib/epley'
 import type { HeatmapDay } from '../components/ConsistencyHeatmap.vue'
 
@@ -357,6 +357,19 @@ const store = useWorkoutStore()
 const { weightUnit, displayWeight, toLbs } = useWeightUnit()
 const { prBaselineDate } = usePRBaseline()
 const { logEvent } = useAnalytics()
+
+/**
+ * The set's load in the words the app uses for it — "Bodyweight", "+25 lbs",
+ * "135 lbs" (LIFT-1373). Rendering `set.weight` bare read "0 lbs" for a
+ * pure-bodyweight set, directly beside the folded e1RM in the same row.
+ */
+function setLoad(set: CalendarSet): string {
+  return formatSetLoad(
+    set,
+    { bodyweightLoaded: set.bodyweightLoaded },
+    { displayWeight, unit: weightUnit.value },
+  )
+}
 
 // ── Tag filtering ────────────────────────────────────────────────
 const activeTagFilters = ref<string[]>([])
