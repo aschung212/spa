@@ -2175,3 +2175,83 @@ describe('Invariant: the exercise picker has one implementation (LIFT-1375)', ()
     ).toEqual([])
   })
 })
+
+
+// ── Invariant: the foreground-resume signal set is defined once (LIFT-1392) ──
+
+/**
+ * "The app came back to the foreground" has no single reliable event on the App
+ * Store target: LIFT-784 established that `visibilitychange` is unreliable in
+ * WKWebView on resume from background, so the answer is the redundant set
+ * `visibilitychange` + `focus` + `pageshow`. Two modules hand-rolled that set
+ * and they drifted — `useSyncRecovery` registered two of the three while its
+ * doc comment claimed parity with `useAuth`, so the WKWebView resume the
+ * rationale was written for refreshed the token and never ran the four-store
+ * read-path recovery (LIFT-1226).
+ *
+ * The set now lives in `lib/foregroundResume.ts` and nowhere else. The scan keys
+ * on the window `focus`/`pageshow` listeners because those are what distinguish
+ * a RESUME detector from a visibility STATE MACHINE: `useWakeLock`,
+ * `useNotification`'s background tracker, App.vue's app-icon badge and
+ * `useServiceWorker`'s update poll all want `visibilitychange` alone (several
+ * need the hide edge too) and are deliberately untouched by this rule.
+ *
+ * Derived rather than enumerated: a hardcoded consumer list pins only the call
+ * sites that existed when it was written, which is exactly how these two copies
+ * drifted apart in the first place.
+ */
+describe('Invariant: the foreground-resume signal set is defined once (LIFT-1392)', () => {
+  const OWNER = join('lib', 'foregroundResume.ts')
+  const RESUME_EVENTS = ['focus', 'pageshow'] as const
+  /** `window.addEventListener('focus'|'pageshow'` — element focus handlers are not this. */
+  const WINDOW_RESUME_LISTENER = /\bwindow\s*\.\s*addEventListener\(\s*['"](focus|pageshow)['"]/
+
+  it('the owner registers the whole set (non-vacuity)', () => {
+    const owner = getSourceFiles().find(f => f.path === OWNER)
+    expect(owner, OWNER + ' owns the foreground-resume signal set').toBeDefined()
+
+    const body = stripComments(owner!.content)
+    for (const event of ['visibilitychange', ...RESUME_EVENTS]) {
+      expect(
+        body,
+        `${OWNER} no longer registers '${event}'. All three are load-bearing: ` +
+        'no one of them fires reliably on a WKWebView resume (LIFT-784), which ' +
+        'is the entire reason this module exists.',
+      ).toContain(`'${event}'`)
+    }
+  })
+
+  it('both lifecycle consumers route through it (non-vacuity)', () => {
+    // If either stops importing the owner, the scan below would pass by having
+    // nothing left to compare against.
+    const importsOwner = getSourceFiles()
+      .filter(f => /from\s+'[./]*(?:\.\.\/)*lib\/foregroundResume'/.test(f.content))
+      .map(f => f.path)
+
+    expect(importsOwner).toContain(join('composables', 'useAuth.ts'))
+    expect(importsOwner).toContain(join('composables', 'useSyncRecovery.ts'))
+  })
+
+  it('no other file hand-rolls a window resume listener', () => {
+    const violations = getSourceFiles()
+      .filter(f => f.path !== OWNER && WINDOW_RESUME_LISTENER.test(stripComments(f.content)))
+      .map(f =>
+        `${f.path} — registers a window 'focus'/'pageshow' listener of its own. ` +
+        'That is half of the WKWebView resume set (LIFT-784), and a partial copy ' +
+        'is what silently disabled read-path recovery on resume (LIFT-1392). ' +
+        'Call onForegroundResume() from lib/foregroundResume.ts instead; it ' +
+        'takes an onHide for consumers that also need the background edge.',
+      )
+
+    expect(violations).toEqual([])
+  })
+
+  it('the scan flags a hand-rolled set and ignores comments and element focus (self-test)', () => {
+    expect(WINDOW_RESUME_LISTENER.test("window.addEventListener('pageshow', onResume)")).toBe(true)
+    expect(WINDOW_RESUME_LISTENER.test("window.addEventListener('focus', resume)")).toBe(true)
+    // Not a resume signal: a state machine over visibility, or a field's own focus.
+    expect(WINDOW_RESUME_LISTENER.test("document.addEventListener('visibilitychange', onVis)")).toBe(false)
+    expect(WINDOW_RESUME_LISTENER.test("input.addEventListener('focus', onFieldFocus)")).toBe(false)
+    expect(WINDOW_RESUME_LISTENER.test(stripComments("// window.addEventListener('focus', resume)"))).toBe(false)
+  })
+})

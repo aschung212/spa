@@ -261,6 +261,21 @@ describe('useSyncRecovery', () => {
       expect(fetchWorkout).toHaveBeenCalledTimes(1)
     })
 
+    it('re-fetches on a pageshow resume (LIFT-1392)', async () => {
+      // The WKWebView case LIFT-784 exists for: the page was evicted while the
+      // app was backgrounded and comes back as a `pageshow`. `useAuth` has
+      // listened for it since that incident; this module claimed parity in its
+      // doc comment and registered only `visibilitychange` + `focus`, so the
+      // token was refreshed and all four stores stayed on stale data until some
+      // later signal happened along.
+      teardown = setupSyncRecovery()
+
+      window.dispatchEvent(new Event('pageshow'))
+      await settle()
+
+      expect(fetchWorkout).toHaveBeenCalledTimes(1)
+    })
+
     it('ignores a background (hidden) visibility change', async () => {
       teardown = setupSyncRecovery()
 
@@ -287,6 +302,8 @@ describe('useSyncRecovery', () => {
 
       window.dispatchEvent(new Event('online'))
       window.dispatchEvent(new Event('focus'))
+      window.dispatchEvent(new Event('pageshow'))
+      document.dispatchEvent(new Event('visibilitychange'))
       sessionRecoveryTick.value++
       await settle()
 

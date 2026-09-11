@@ -8,6 +8,7 @@ import { useProgressionStore } from '../stores/progression'
 import { resetXPCeremony } from '../composables/xpCeremonyUI'
 import { syncQueue } from '../lib/syncQueue'
 import { deleteAllIDB } from '../lib/durableStorage'
+import { onForegroundResume } from '../lib/foregroundResume'
 import { logError } from '../lib/logger'
 import { clearReauthFlag } from '../lib/sessionHealth'
 import type { User, Provider } from '@supabase/supabase-js'
@@ -59,30 +60,24 @@ let _lifecycleCleanups: Array<() => void> = []
  * supabase-js pauses its refresh timer while the document is hidden and relies
  * on `visibilitychange` to resume — but that event is unreliable in
  * WKWebView/Capacitor (the App Store target) when coming back from the
- * background, so the access token can quietly expire mid-session. We listen to
- * `visibilitychange` plus `focus` and `pageshow` as redundant resume signals;
- * `startAutoRefresh()` immediately checks the token and refreshes it if it is
- * within the expiry margin. `stopAutoRefresh()` on hide avoids a wasted timer.
+ * background, so the access token can quietly expire mid-session. The redundant
+ * `visibilitychange` + `focus` + `pageshow` set that answers that now lives in
+ * `onForegroundResume` (LIFT-1392), shared with the read-path recovery that
+ * had drifted to a subset of it. `startAutoRefresh()` immediately checks the
+ * token and refreshes it if it is within the expiry margin; `stopAutoRefresh()`
+ * on hide avoids a wasted timer.
  */
 function setupSessionRefreshLifecycle(): void {
-  if (!supabase || typeof document === 'undefined') return
+  if (!supabase) return
   const client = supabase
-  const resume = () => { void client.auth.startAutoRefresh() }
-  const pause = () => { void client.auth.stopAutoRefresh() }
-  const onVisibility = () => {
-    if (document.visibilityState === 'visible') resume()
-    else pause()
-  }
-  document.addEventListener('visibilitychange', onVisibility)
-  window.addEventListener('focus', resume)
-  window.addEventListener('pageshow', resume)
-  _lifecycleCleanups.push(
-    () => document.removeEventListener('visibilitychange', onVisibility),
-    () => window.removeEventListener('focus', resume),
-    () => window.removeEventListener('pageshow', resume),
-  )
-  // Kick off the loop for the session that is already in the foreground.
-  if (document.visibilityState === 'visible') resume()
+  _lifecycleCleanups.push(onForegroundResume(
+    () => { void client.auth.startAutoRefresh() },
+    {
+      onHide: () => { void client.auth.stopAutoRefresh() },
+      // Kick off the loop for the session that is already in the foreground.
+      immediate: true,
+    },
+  ))
 }
 
 // LIFT-1212: on a signed-in cold start BOTH the getSession() resolution and
