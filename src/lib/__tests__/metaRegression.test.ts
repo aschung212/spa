@@ -116,6 +116,44 @@ describe('index.html meta tag regression tests', () => {
     })
   })
 
+  describe('viewport permits pinch-zoom (WCAG 1.4.4 / 1.4.10 — LIFT-1376)', () => {
+    // The tag shipped as `... maximum-scale=1.0, user-scalable=no ...`, which
+    // disables pinch-zoom outright: a WCAG 2.1 AA failure on both Resize Text
+    // and Reflow, and a scored Lighthouse a11y audit. Nothing caught it because
+    // this file only ever pinned URLs and the `--font-*` scale was rem-anchored
+    // for exactly this reason (LIFT-988) — the CSS claimed a compliance the
+    // meta tag revoked one file away.
+    //
+    // The zoom lock was ALSO suppressing iOS Safari's zoom-on-focus, so lifting
+    // it is only safe while every focusable text control computes to >= 16px.
+    // That half is enforced in cssRegression.test.ts ("iOS focus-zoom floor").
+    // If an input starts zooming the page on focus, raise its font-size — do
+    // not re-add the lock here.
+    const viewport = html.match(/<meta name="viewport" content="([^"]+)"/)
+
+    it('declares a viewport meta at all', () => {
+      expect(viewport).not.toBeNull()
+    })
+
+    it('does not disable user scaling', () => {
+      expect(viewport![1]).not.toMatch(/user-scalable\s*=\s*(no|0)/i)
+    })
+
+    it('does not cap the zoom factor below 5x', () => {
+      // Lighthouse and WCAG both accept a maximum-scale of >= 5; anything
+      // lower (and 1.0 in particular) is treated as a zoom block.
+      const max = viewport![1].match(/maximum-scale\s*=\s*([\d.]+)/i)
+      if (max) expect(Number(max[1])).toBeGreaterThanOrEqual(5)
+    })
+
+    it('still sizes to the device and covers the safe area', () => {
+      // viewport-fit=cover is what makes env(safe-area-inset-*) resolve to real
+      // values on notched devices — every fixed/sticky surface depends on it.
+      expect(viewport![1]).toContain('width=device-width')
+      expect(viewport![1]).toContain('viewport-fit=cover')
+    })
+  })
+
   describe('no references to domains we do not own', () => {
     it('does not reference liftracker.app (competitor domain)', () => {
       expect(html).not.toContain('liftracker.app')

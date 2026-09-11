@@ -2,7 +2,18 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <!--
+    No maximum-scale / user-scalable here: blocking pinch-zoom fails WCAG 2.1 AA
+    1.4.4 (Resize Text) and 1.4.10 (Reflow), and the CSS type scale is
+    rem-anchored precisely so text CAN scale (see the --font-* block in
+    index.css). The lock was silently suppressing iOS Safari's zoom-on-focus,
+    so it can only be lifted while every focusable text control computes to at
+    least 16px — enforced by the iOS focus-zoom floor test in
+    cssRegression.test.ts. Never re-add the lock to "fix" a zooming input;
+    raise the input's font-size instead. viewport-fit=cover stays: it is what
+    makes env(safe-area-inset-*) resolve on notched devices.
+  -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 
   <!-- PWA / iOS -->
   <meta name="apple-mobile-web-app-capable" content="yes" />

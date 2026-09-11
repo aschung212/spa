@@ -220,7 +220,9 @@ function onShow(tag: string) {
   width: 48px;
   min-height: 36px;
   padding: 8px;
-  font-size: 14px;
+  /* Token, not a raw px: the scale is rem-anchored so text honors Dynamic
+     Type, and callout is the 16px iOS focus-zoom floor (LIFT-1376). */
+  font-size: var(--font-callout);
   text-align: center;
   background: var(--bg-elevated);
   color: var(--text-primary);
