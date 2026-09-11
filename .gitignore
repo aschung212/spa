@@ -10,6 +10,8 @@ coverage/
 
 # Vitest sharded blob reports (merged in CI)
 .vitest-reports/
+# Vitest 5's default output root (blob reports, attachments)
+.vitest/
 
 # Playwright
 test-results/
