@@ -55,10 +55,22 @@ alter table exercises alter column bar_weight drop not null;
 -- The updated_at trigger is suppressed for the backfill. Bumping every
 -- exercise's timestamp would hand the server the win in the next last-write-wins
 -- merge for rows where a device still holds an unflushed offline edit, reverting
--- it. The repair does not need the bump: a synced exercise's server `updated_at`
--- is already at or ahead of the local one (the server stamps at write time,
--- after the client's), so the remote row wins the next merge anyway and the
--- cleared value propagates to local state on its own.
+-- it.
+--
+-- THIS BACKFILL ALONE DOES NOT REACH A DEVICE THAT ALREADY HOLDS THE ROW, and
+-- it must not be "fixed" by adding the bump (LIFT-1398). This comment used to
+-- claim the cleared value would propagate on its own, "because the remote row
+-- wins the next merge anyway". It does not: that device adopted the server row
+-- verbatim — the 45 AND this very `updated_at` (`mapRemoteExercise` copies it
+-- as-is) — so leaving the stamp alone means local and remote TIE, `mergeEntities`
+-- gives ties to LOCAL, and `_fetchFromSupabase` re-upserts every tied exercise
+-- with `bar_weight: barWeight ?? null`. The 45 goes straight back.
+--
+-- The repair those devices need is therefore client-side, in
+-- `src/lib/barWeightRepair.ts`: a one-shot pass that drops a stored 45 so the
+-- unit-aware `defaultBarWeight` is reachable again. It leaves `updated_at` alone
+-- for the same reason this statement does, and it does not need to push — once
+-- local holds no bar, the same tie-upsert above carries `bar_weight: null`.
 alter table exercises disable trigger trg_exercises_updated_at;
 update exercises set bar_weight = null where bar_weight = 45;
 alter table exercises enable trigger trg_exercises_updated_at;

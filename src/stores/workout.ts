@@ -15,6 +15,11 @@ import { persistStoreData, loadStoreData } from '../lib/storePersistence'
 import { parseExercises, parseStringArray, parseNumberRecord } from '../lib/parseGuards'
 import { sanitizeIntensityMaxReps } from '../lib/intensityTable'
 import { convertBarWeight } from '../lib/plateCalculator'
+import {
+  isBarWeightRepairDone,
+  markBarWeightRepairDone,
+  repairMaterializedBarWeights,
+} from '../lib/barWeightRepair'
 import { sanitizeExerciseNotes } from '../lib/inputLimits'
 import { sanitizeExerciseEquipment, type ExerciseEquipment } from '../lib/coachAnalytics'
 import { sanitizeExerciseGyms } from '../lib/gyms'
@@ -276,7 +281,16 @@ function load(): Exercise[] {
   // entries (logWarn), normalizes tags/sets, and sanitizes the Intensity-lens
   // config, equipment classification, and gym membership (#961) through the same
   // helpers the setters use.
-  return parseExercises(loadStoreData<unknown[]>('workout', STORAGE_KEY, () => [], Array.isArray))
+  const parsed = parseExercises(loadStoreData<unknown[]>('workout', STORAGE_KEY, () => [], Array.isArray))
+  // Clear the bar weight the dropped `bar_weight NOT NULL DEFAULT 45` invented
+  // (LIFT-1398). The server-side backfill cannot reach a device that already
+  // holds the row: it left `updated_at` alone on purpose, so local and remote
+  // tie, ties go to local, and the tie is re-upserted — writing the 45 straight
+  // back over the cleared column. This is a transform of the parsed payload, not
+  // a side effect, so it costs the state factory nothing; the flag is burned
+  // only once a fetch has repaired the server's copy too (see `_fetchFromSupabase`).
+  if (!isBarWeightRepairDone()) repairMaterializedBarWeights(parsed)
+  return parsed
 }
 
 export const useWorkoutStore = defineStore('workout', () => {
@@ -745,6 +759,39 @@ export const useWorkoutStore = defineStore('workout', () => {
     // the alternative, patching the union loop alone, would leave the same hole
     // open for any future path that adopts a remote set.
     restoreLocalOnlySetFields(deduped.exercises, localOnlySetFields)
+
+    // Clear the bar weight the `bar_weight NOT NULL DEFAULT 45` column default
+    // invented, on the server's copy of these rows as well as the local one
+    // (LIFT-1398). `load()` already ran this pass over whatever localStorage
+    // held, but that alone leaves two holes only the fetch can close: a device
+    // that hydrates the row for the FIRST time (a new sign-in, or the PWA
+    // reinstall of #1152) adopts the server's 45 long after the local pass ran,
+    // and `mergeExerciseMetadata`'s `fill` rule can put an absorbed duplicate's
+    // 45 back onto the survivor. Placed here, after both dedup passes, for the
+    // same reason `restoreLocalOnlySetFields` is: it then covers every exercise
+    // about to be committed rather than one path's worth.
+    //
+    // Nothing is pushed from here, and `updated_at` is deliberately untouched:
+    // the row now ties its remote twin, a tie is a `localWins`, and the
+    // `filteredLocalWins` loop below re-upserts it with `bar_weight: null` —
+    // the same code path that used to push the 45 back.
+    //
+    // The flag is burned HERE and nowhere else. Setting it in `load()` would
+    // consume the repair on a device that has never seen the server's copy of
+    // these rows (signed out, offline, mid-reinstall), leaving a 45 it adopts
+    // later in place forever. Every early return above — no client, no user, a
+    // failed query — leaves it unset, so the pass simply retries next launch.
+    //
+    // One residual, bounded by the migration this depends on: a device that has
+    // already burned the flag and then signs into a DIFFERENT account (the flag
+    // is per-device, and sign-out does not clear localStorage) would adopt that
+    // account's 45s unrepaired. That can only happen while server rows still
+    // hold a 45 at all — i.e. before the backfill above has run — so it closes
+    // with the migration rather than needing a per-user flag here.
+    if (!isBarWeightRepairDone()) {
+      repairMaterializedBarWeights(deduped.exercises)
+      markBarWeightRepairDone()
+    }
 
     exercises.value = deduped.exercises
     _invalidateDayCounts()
