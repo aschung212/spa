@@ -41,6 +41,11 @@ const mockOnAuthStateChange = vi.fn().mockReturnValue({ data: { subscription: { 
 const mockDelete = vi.fn().mockReturnValue({ eq: vi.fn().mockResolvedValue({ error: null }) })
 const mockFrom = vi.fn().mockReturnValue({ delete: () => mockDelete() })
 const mockRpc = vi.fn().mockResolvedValue({ data: null, error: null })
+// Hoisted (not inline in the factory below): `vi.resetModules()` in beforeEach
+// re-runs the factory, so an inline `vi.fn()` would be a fresh spy the test
+// never holds a reference to.
+const mockStartAutoRefresh = vi.fn()
+const mockStopAutoRefresh = vi.fn()
 
 vi.mock('../../lib/supabase', () => ({
   supabase: {
@@ -51,8 +56,8 @@ vi.mock('../../lib/supabase', () => ({
       signOut: (...args: unknown[]) => mockSignOut(...args),
       getSession: (...args: unknown[]) => mockGetSession(...args),
       onAuthStateChange: (...args: unknown[]) => mockOnAuthStateChange(...args),
-      startAutoRefresh: vi.fn(),
-      stopAutoRefresh: vi.fn(),
+      startAutoRefresh: (...args: unknown[]) => mockStartAutoRefresh(...args),
+      stopAutoRefresh: (...args: unknown[]) => mockStopAutoRefresh(...args),
     },
     from: (...args: unknown[]) => mockFrom(...args),
     rpc: (...args: unknown[]) => mockRpc(...args),
@@ -345,6 +350,88 @@ describe('useAuth', () => {
       expect(mockSyncQueueClear).not.toHaveBeenCalled()
       expect(mockWorkoutReset).not.toHaveBeenCalled()
       expect(user.value).toBeNull()
+    })
+  })
+
+  // Regression LIFT-1392: the token-refresh re-arm is the ORIGINAL consumer of
+  // the redundant WKWebView resume signal set (LIFT-784), and it now shares that
+  // set with the read-path recovery instead of spelling it out inline. These
+  // assert the half useAuth still owns: which side of the foreground edge drives
+  // start vs stop, and that the already-foregrounded session is armed with no
+  // event at all. The three events themselves are pinned in
+  // `lib/__tests__/foregroundResume.test.ts`, and the invariant scan in
+  // `architecturalInvariants.test.ts` keeps this from drifting back to a copy.
+  describe('session refresh lifecycle (LIFT-784 / LIFT-1392)', () => {
+    function setVisibility(state: 'visible' | 'hidden') {
+      Object.defineProperty(document, 'visibilityState', { value: state, configurable: true })
+    }
+
+    async function initLifecycle() {
+      vi.stubEnv('DEV', false)
+      mockGetSession.mockResolvedValue({ data: { session: null } })
+      vi.resetModules()
+      const mod = await import('../useAuth')
+      const auth = mod.useAuth()
+      auth.init()
+      return auth
+    }
+
+    /**
+     * How many times THIS registration handles `fire()`.
+     *
+     * Every `init()` in this file registers on the shared document/window and
+     * they all route to the same spy, so a bare `toHaveBeenCalled()` would pass
+     * off a listener leaked by an earlier test — i.e. pass even with the
+     * lifecycle wiring deleted. Measure with it live, tear it down, measure
+     * again: the leaked count is identical on both sides, so the difference is
+     * ours alone.
+     */
+    async function handlerDelta(spy: ReturnType<typeof vi.fn>, fire: () => void) {
+      const auth = await initLifecycle()
+      spy.mockClear()
+      fire()
+      const live = spy.mock.calls.length
+      auth.destroy()
+      spy.mockClear()
+      fire()
+      return live - spy.mock.calls.length
+    }
+
+    afterEach(() => {
+      setVisibility('visible')
+      vi.unstubAllEnvs()
+    })
+
+    it.each([
+      ['visibilitychange', () => document.dispatchEvent(new Event('visibilitychange'))],
+      ['focus', () => window.dispatchEvent(new Event('focus'))],
+      ['pageshow', () => window.dispatchEvent(new Event('pageshow'))],
+    ])('re-arms supabase-js auto-refresh on %s', async (_name, fire) => {
+      setVisibility('visible')
+
+      expect(await handlerDelta(mockStartAutoRefresh, fire)).toBe(1)
+    })
+
+    it('pauses the refresh timer when the app goes to the background', async () => {
+      const delta = await handlerDelta(mockStopAutoRefresh, () => {
+        setVisibility('hidden')
+        document.dispatchEvent(new Event('visibilitychange'))
+      })
+
+      expect(delta).toBe(1)
+    })
+
+    it('arms the session that is already in the foreground', async () => {
+      // No resume event is coming for a page that never left, so without this
+      // the first visit of a session would run with the timer never started.
+      setVisibility('visible')
+      mockStartAutoRefresh.mockClear()
+
+      const auth = await initLifecycle()
+
+      // No event dispatched, so nothing leaked from an earlier test can fire.
+      expect(mockStartAutoRefresh).toHaveBeenCalledTimes(1)
+      auth.destroy()
     })
   })
 

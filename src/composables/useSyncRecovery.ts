@@ -19,8 +19,8 @@
  * This module is the single WRITE-REPLAY + re-fetch entry point for all four
  * stores, plus the listeners that drive it:
  *   - `online`               — the connection came back
- *   - foreground resume      — `visibilitychange` + `focus`, the WKWebView
- *                              resume signals `useAuth` already doubles up on
+ *   - foreground resume      — the shared `onForegroundResume` signal set
+ *                              (`visibilitychange` + `focus` + `pageshow`)
  *   - `sessionRecoveryTick`  — a 401 was healed by a token refresh
  *
  * Overlapping and repeated triggers are collapsed: one run at a time
@@ -29,6 +29,7 @@
  */
 import { watch } from 'vue'
 import { syncQueue } from '../lib/syncQueue'
+import { onForegroundResume } from '../lib/foregroundResume'
 import { sessionRecoveryTick } from '../lib/sessionHealth'
 import { logError } from '../lib/logger'
 import { useWorkoutStore } from '../stores/workout'
@@ -151,31 +152,29 @@ export function refetchAllStores(trigger: RefetchTrigger): Promise<boolean> {
 /**
  * Register the recovery listeners. Returns a teardown for `onUnmounted`.
  *
- * `visibilitychange` and `focus` are both listened to for the same reason
- * `useAuth.setupSessionRefreshLifecycle` does: in WKWebView (the App Store
- * target) neither is reliable alone on resume from background. The duplicate
- * triggers are absorbed by the cooldown.
+ * The foreground signal set comes from `onForegroundResume` rather than being
+ * spelled out here (LIFT-1392). It used to be, and it had quietly drifted to
+ * `visibilitychange` + `focus` while the comment claimed parity with
+ * `useAuth.setupSessionRefreshLifecycle` — which listens to those two PLUS
+ * `pageshow` precisely because neither of the first two is reliable alone in
+ * WKWebView (LIFT-784). So on the one resume path that rationale was written
+ * for, the token got refreshed and this recovery never ran. The duplicate
+ * triggers a single resume can deliver are absorbed by the cooldown.
+ *
+ * `pageshow` also fires once for the initial page load, which lands here at cold
+ * start: that run is a no-op (every store's `_fetchFromSupabase` returns early
+ * until `init()` sets its `_userId`) and costs only the cooldown window, during
+ * which `initStores` is doing the very fetching a recovery would repeat.
  */
 export function setupSyncRecovery(): () => void {
   const cleanups: Array<() => void> = []
 
+  cleanups.push(onForegroundResume(() => { void refetchAllStores('resume') }))
+
   if (typeof window !== 'undefined') {
     const onOnline = () => { void refetchAllStores('online') }
-    const onFocus = () => { void refetchAllStores('resume') }
     window.addEventListener('online', onOnline)
-    window.addEventListener('focus', onFocus)
-    cleanups.push(
-      () => window.removeEventListener('online', onOnline),
-      () => window.removeEventListener('focus', onFocus),
-    )
-  }
-
-  if (typeof document !== 'undefined') {
-    const onVisibility = () => {
-      if (document.visibilityState === 'visible') void refetchAllStores('resume')
-    }
-    document.addEventListener('visibilitychange', onVisibility)
-    cleanups.push(() => document.removeEventListener('visibilitychange', onVisibility))
+    cleanups.push(() => window.removeEventListener('online', onOnline))
   }
 
   cleanups.push(watch(sessionRecoveryTick, () => { void refetchAllStores('session-recovered') }))
