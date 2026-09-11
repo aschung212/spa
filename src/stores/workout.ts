@@ -90,6 +90,39 @@ export interface Exercise {
   updated_at?: string              // ISO 8601, used for last-write-wins merge
   archived_at?: string             // ISO 8601, soft-hide from main list; data is preserved
   sample?: boolean                 // true for onboarding sample data — never synced to Supabase
+  /**
+   * Server ids of the same-named duplicate rows `deduplicateByName` absorbed
+   * into this one (LIFT-1335). LOCAL-ONLY — it is not a column, is never sent in
+   * `_buildExerciseUpsert`, and is recomputed from the server rows on every
+   * fetch. It exists because the merge is display-only: the duplicates keep
+   * their own rows (and their own `exercise_id` on their sets) server-side, so
+   * one local row can stand for several remote ones, and every id-taking write
+   * path — delete, restore — has to address all of them. See
+   * `exerciseServerIds`.
+   */
+  mergedFrom?: string[]
+}
+
+/**
+ * Every server row a local exercise row stands for (LIFT-1335): its own id plus
+ * the ids of the same-named duplicates absorbed into it by `deduplicateByName`.
+ *
+ * Deleting a merged exercise used to soft-delete only the primary's row, so the
+ * absorbed duplicate came straight back on the next fetch carrying its sets and
+ * had to be deleted a second time. This is the single translation point from
+ * "the row the user is looking at" to "the rows on the server", so a new
+ * id-taking write path gets the full set by calling it rather than by
+ * remembering that `exercise.id` is sometimes an undercount.
+ *
+ * It is emphatically NOT a name-based lookup: re-deriving duplicates by name at
+ * delete time would be exactly the dedup-derived server mutation the 2026-04-12
+ * SEV1 banned. These ids were observed on the server, in one fetch, as rows
+ * sharing this row's name — and they are only ever acted on when the user asks
+ * for this row to be deleted or restored.
+ */
+export function exerciseServerIds(exercise: Pick<Exercise, 'id' | 'mergedFrom'>): string[] {
+  if (!exercise.mergedFrom?.length) return [exercise.id]
+  return [...new Set([exercise.id, ...exercise.mergedFrom])]
 }
 
 export interface OverloadSuggestion {
@@ -149,6 +182,16 @@ export function deduplicateSets(sets: WorkoutSet[]): { unique: WorkoutSet[]; rem
  * Every non-set field is resolved by `EXERCISE_MERGE_RULES` (LIFT-1369) — see
  * `src/lib/exerciseMerge.ts` for the policy and why it is a total map over
  * `keyof Exercise` rather than a hand-written list.
+ *
+ * The primary records the absorbed rows' ids in `mergedFrom` (LIFT-1335) so a
+ * later delete can reach the rows this one now stands for. That list is
+ * REPLACED, not accumulated: it is only ever populated from the exercises in
+ * this call, which for the one production caller (`_fetchFromSupabase`) is the
+ * union of local state and the rows the server currently holds. A duplicate
+ * that is no longer in that union is no longer live, so dropping it keeps the
+ * field an accurate description of what this row currently absorbs rather than
+ * an ever-growing pile of dead uuids. The re-merge is idempotent, so a duplicate
+ * that disappears from one fetch and returns in a later one is re-recorded.
  */
 export function deduplicateByName(exercises: Exercise[]): { exercises: Exercise[]; removed: Exercise[] } {
   const groups = new Map<string, Exercise[]>()
@@ -163,6 +206,7 @@ export function deduplicateByName(exercises: Exercise[]): { exercises: Exercise[
 
   for (const group of groups.values()) {
     if (group.length === 1) {
+      delete group[0].mergedFrom
       result.push(group[0])
       continue
     }
@@ -210,6 +254,15 @@ export function deduplicateByName(exercises: Exercise[]): { exercises: Exercise[
     // the volume they report. Display-only: nothing is written back to the
     // absorbed row and `updated_at` is not bumped (2026-04-12 SEV1).
     mergeExerciseMetadata(primary, group.slice(1))
+    // Record which server rows this one now stands for, so a later delete or
+    // restore reaches all of them and not just the primary's (LIFT-1335). The
+    // merge is display-only — each absorbed duplicate keeps its own `exercises`
+    // row, and its sets keep their own `exercise_id` — so `primary.id` alone is
+    // an undercount of the rows the user is looking at, and this is the only
+    // place those ids are ever in scope.
+    const absorbed = group.slice(1).map(ex => ex.id).filter(id => id !== primary.id)
+    if (absorbed.length > 0) primary.mergedFrom = absorbed
+    else delete primary.mergedFrom
     result.push(primary)
   }
 
@@ -1208,19 +1261,39 @@ export const useWorkoutStore = defineStore('workout', () => {
   function deleteExercise(exerciseId: string, { sync = true }: { sync?: boolean } = {}) {
     const idx = exercises.value.findIndex((e: Exercise) => e.id === exerciseId)
     if (idx === -1) return
-    addTombstone(TOMBSTONE_STORE, exerciseId)
+    // Tombstone EVERY server row this local row stands for (LIFT-1335) — an
+    // absorbed duplicate that keeps its tombstone-free row on the server sails
+    // back through the fetch filter and the exercise reappears with its sets.
+    const serverIds = exerciseServerIds(exercises.value[idx])
+    for (const id of serverIds) addTombstone(TOMBSTONE_STORE, id)
     exercises.value.splice(idx, 1)
     triggerRef(exercises)
     _persist()
 
     if (sync && supabase && !isPreviewMode.value && _userId) {
-      _enqueueSoftDelete(`exercise-sets:${exerciseId}`, 'sets', { exercise_id: exerciseId, user_id: _userId })
-      _enqueueSoftDelete(`exercise:${exerciseId}`, 'exercises', { id: exerciseId, user_id: _userId })
+      _syncDeleteExerciseRows(serverIds, _userId)
+    }
+  }
+
+  /**
+   * Soft-delete an exercise row and its sets for every id the local row covers.
+   * Shared by the immediate-delete path and the undo-commit path
+   * (`syncDeleteExercise`) so the two can't disagree about which rows a delete
+   * reaches — the drift that let a merged duplicate survive its own deletion.
+   */
+  function _syncDeleteExerciseRows(serverIds: string[], userId: string) {
+    for (const id of serverIds) {
+      _enqueueSoftDelete(`exercise-sets:${id}`, 'sets', { exercise_id: id, user_id: userId })
+      _enqueueSoftDelete(`exercise:${id}`, 'exercises', { id, user_id: userId })
     }
   }
 
   function restoreExercise(exercise: Exercise, atIndex?: number) {
-    removeTombstone(TOMBSTONE_STORE, exercise.id)
+    // Symmetric with deleteExercise: an undo has to un-tombstone and un-delete
+    // the absorbed duplicates too, or the restored row loses their sets on the
+    // next fetch (LIFT-1335).
+    const serverIds = exerciseServerIds(exercise)
+    for (const id of serverIds) removeTombstone(TOMBSTONE_STORE, id)
     if (atIndex !== undefined && atIndex >= 0 && atIndex <= exercises.value.length) {
       exercises.value.splice(atIndex, 0, exercise)
     } else {
@@ -1238,8 +1311,10 @@ export const useWorkoutStore = defineStore('workout', () => {
     // alternative (tracking per-cascade timestamps) is complexity without
     // matching benefit for immediate-undo UX.
     if (supabase && !isPreviewMode.value && _userId) {
-      _enqueueRestore(`exercise-sets:${exercise.id}`, 'sets', { exercise_id: exercise.id, user_id: _userId })
-      _enqueueRestore(`exercise:${exercise.id}`, 'exercises', { id: exercise.id, user_id: _userId })
+      for (const id of serverIds) {
+        _enqueueRestore(`exercise-sets:${id}`, 'sets', { exercise_id: id, user_id: _userId })
+        _enqueueRestore(`exercise:${id}`, 'exercises', { id, user_id: _userId })
+      }
     }
   }
 
@@ -1282,10 +1357,16 @@ export const useWorkoutStore = defineStore('workout', () => {
     }
   }
 
-  function syncDeleteExercise(exerciseId: string) {
+  /**
+   * Commit a `deleteExercise(id, { sync: false })` to the server once the undo
+   * window closes. Takes the EXERCISE, not an id: a local row can stand for
+   * several server rows (LIFT-1335) and by the time this runs the row is gone
+   * from `exercises.value`, so `mergedFrom` can only arrive from the copy the
+   * undo toast is holding.
+   */
+  function syncDeleteExercise(exercise: Pick<Exercise, 'id' | 'mergedFrom'>) {
     if (supabase && _userId) {
-      _enqueueSoftDelete(`exercise-sets:${exerciseId}`, 'sets', { exercise_id: exerciseId, user_id: _userId })
-      _enqueueSoftDelete(`exercise:${exerciseId}`, 'exercises', { id: exerciseId, user_id: _userId })
+      _syncDeleteExerciseRows(exerciseServerIds(exercise), _userId)
     }
   }
 

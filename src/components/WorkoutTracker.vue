@@ -3313,7 +3313,7 @@ function undoDeleteExercise(exercise: Exercise) {
     `"${saved.name}" deleted`,
     () => store.restoreExercise(saved, idx),
     () => {
-      store.syncDeleteExercise(saved.id)
+      store.syncDeleteExercise(saved)
       saved.sets.forEach(s => progressionStore.removeSetXP(s.id))
     },
   )

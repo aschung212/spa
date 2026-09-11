@@ -115,6 +115,12 @@ export const EXERCISE_MERGE_RULES = {
   // Resolved by its own rule: a sample row that absorbs a real one is adopted
   // (flag cleared) so it starts syncing, rather than either value being copied.
   sample: 'derived',
+  // Local-only bookkeeping (LIFT-1335): the ids of the rows the primary absorbed,
+  // so a delete or restore reaches every server row the user is looking at.
+  // Recomputed from the group by `deduplicateByName` after the metadata pass,
+  // never copied from a duplicate — a duplicate's own list names rows that are
+  // either in this group already or no longer live.
+  mergedFrom: 'derived',
 } as const satisfies Record<keyof Exercise, ExerciseMergeRule>
 
 type MergeRuleMap = typeof EXERCISE_MERGE_RULES
@@ -145,7 +151,8 @@ function fillField<K extends ExerciseFillField>(primary: Exercise, value: Exerci
  * Merge the absorbed rows' metadata into the primary, in place.
  *
  * Covers every field except `sets` (unioned by id in `deduplicateByName`, which
- * owns the set-identity rules) and `sample` (adopted there too). Returns the
+ * owns the set-identity rules), `sample` (adopted there too) and `mergedFrom`
+ * (recomputed there from the group, LIFT-1335). Returns the
  * number of fields filled from a duplicate, so a test can prove the pass did
  * something rather than passing vacuously.
  */
