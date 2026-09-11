@@ -699,6 +699,140 @@ describeIntegration('Supabase integration: PostgREST query shape validation', ()
     })
   })
 
+  // ── updated_at trigger (LIFT-1401) ─────────────────────────────
+
+  /**
+   * Last-write-wins is only a conflict resolution if the timestamps it compares
+   * actually move, and for these three tables the SERVER is the only thing that
+   * can move them: no client producer sends `updated_at`
+   * (`_buildExerciseUpsert`, `_enqueueSetUpsert`, `_enqueueEntryUpsert` each
+   * enumerate their columns and it is not among them). With no trigger, a row's
+   * stamp is its INSERT-time `default now()` forever — every merge is a tie,
+   * `mergeEntities` scores a tie as a LOCAL win, and a remote edit can never
+   * win: the stale device re-upserts over the other one and never converges.
+   *
+   * That is not hypothetical. LIFT-1397's `supabase db push` answered SQLSTATE
+   * 42704 for `trg_exercises_updated_at`, proving
+   * `20250401000000_add_updated_at_columns.sql` never ran on production — its
+   * version was baselined into `schema_migrations` while the schema arrived by
+   * hand. **Prod's schema is not the migration history.**
+   *
+   * These tests cannot read production, and nothing in CI can. What they pin is
+   * the layer below it: that the migration corpus, applied to a real Postgres,
+   * actually produces a trigger that FIRES. `architecturalInvariants.test.ts`
+   * proves the `create trigger` statement is present as text; only a real
+   * database can prove the function resolves, the trigger is attached to the
+   * right event, and nothing has left it DISABLED — the state
+   * `20260909000000_make_bar_weight_nullable.sql` puts `exercises` into around
+   * its backfill, and would leave it in permanently if it ever failed to
+   * re-enable.
+   *
+   * Every write below goes through `upsert` with NO `updated_at` in the
+   * payload, which is the shape the client actually sends. The existing
+   * "last-write-wins" test one describe up passes `updated_at` explicitly, so
+   * it would keep passing with every trigger dropped — the fixture supplies the
+   * very thing whose absence is the bug.
+   */
+  describe('updated_at trigger maintains the last-write-wins stamp', () => {
+    /**
+     * `updated_at` of the one row with this id, as epoch ms.
+     *
+     * All three tables carry the column, but `from()` narrows on a literal
+     * table name — the cast keeps one helper instead of three identical ones
+     * and is runtime-identical (the string is passed straight through).
+     */
+    async function stampOf(
+      table: 'exercises' | 'sets' | 'bodyweight_entries',
+      id: string,
+    ): Promise<number> {
+      const { data, error } = await supabase
+        .from(table as 'exercises')
+        .select('updated_at')
+        .eq('id', id)
+        .single()
+      expect(error).toBeNull()
+      const stamp = Date.parse(data!.updated_at)
+      expect(Number.isFinite(stamp)).toBe(true)
+      return stamp
+    }
+
+    it('bumps exercises.updated_at on an upsert that omits the column', async () => {
+      const userId = await createTestUser()
+      const exerciseId = uuid()
+
+      // Exactly `_buildExerciseUpsert`'s shape in the respect that matters:
+      // no `updated_at`, so the column can only be filled by `default now()`.
+      const { error: insertError } = await supabase.from('exercises').upsert({
+        id: exerciseId, user_id: userId, name: 'Bench Press', tags: [],
+      })
+      expect(insertError).toBeNull()
+      const inserted = await stampOf('exercises', exerciseId)
+
+      // The rename device B makes. Through PostgREST this is its own
+      // transaction, so `now()` is strictly later than the insert's.
+      const { error } = await supabase.from('exercises').upsert({
+        id: exerciseId, user_id: userId, name: 'Incline Bench Press', tags: ['Push'],
+      })
+      expect(error).toBeNull()
+
+      expect(await stampOf('exercises', exerciseId)).toBeGreaterThan(inserted)
+    })
+
+    it('bumps sets.updated_at and bodyweight_entries.updated_at too', async () => {
+      const userId = await createTestUser()
+      const exerciseId = uuid()
+      const setId = uuid()
+      const entryId = uuid()
+      const ts = now()
+
+      await supabase.from('exercises').upsert({
+        id: exerciseId, user_id: userId, name: 'Squat', tags: [],
+      })
+      await supabase.from('sets').upsert({
+        id: setId, user_id: userId, exercise_id: exerciseId,
+        date: ts, weight: 225, reps: 5, estimated_1rm: 253,
+      })
+      await supabase.from('bodyweight_entries').upsert({
+        id: entryId, user_id: userId, date: ts, weight: 180,
+      })
+      const setInserted = await stampOf('sets', setId)
+      const entryInserted = await stampOf('bodyweight_entries', entryId)
+
+      // A corrected set and a corrected weigh-in — `updateSet` / `updateEntry`.
+      await supabase.from('sets').upsert({
+        id: setId, user_id: userId, exercise_id: exerciseId,
+        date: ts, weight: 235, reps: 5, estimated_1rm: 264,
+      })
+      await supabase.from('bodyweight_entries').upsert({
+        id: entryId, user_id: userId, date: ts, weight: 178.5,
+      })
+
+      expect(await stampOf('sets', setId)).toBeGreaterThan(setInserted)
+      expect(await stampOf('bodyweight_entries', entryId)).toBeGreaterThan(entryInserted)
+    })
+
+    it('bumps updated_at on the soft-delete UPDATE path as well', async () => {
+      // `enqueueDelete` sends `{ deleted_at }` and nothing else, so a delete
+      // that raced an edit on another device would otherwise merge as a tie.
+      const userId = await createTestUser()
+      const exerciseId = uuid()
+
+      await supabase.from('exercises').upsert({
+        id: exerciseId, user_id: userId, name: 'Overhead Press', tags: [],
+      })
+      const inserted = await stampOf('exercises', exerciseId)
+
+      const { error } = await supabase
+        .from('exercises')
+        .update({ deleted_at: now() })
+        .eq('id', exerciseId)
+        .eq('user_id', userId)
+      expect(error).toBeNull()
+
+      expect(await stampOf('exercises', exerciseId)).toBeGreaterThan(inserted)
+    })
+  })
+
   // ── Account deletion (#1299) ───────────────────────────────────
 
   // The one thing no fake-Supabase test in this repo can check: whether the

@@ -2175,3 +2175,245 @@ describe('Invariant: the exercise picker has one implementation (LIFT-1375)', ()
     ).toEqual([])
   })
 })
+
+// ── Invariant: a merge timestamp has somebody stamping it (LIFT-1401) ────────
+// Guard: last-write-wins is only a conflict resolution if the timestamps it
+// compares actually move. `mergeEntities` scores an exact tie as a LOCAL win
+// (`localTime >= remoteTime`) and both fetch paths re-push every local win, so
+// a table whose server-side `updated_at` is frozen at its INSERT-time
+// `default now()` does not merely resolve conflicts badly — **a remote edit can
+// never win.** Device A keeps the stale value, re-upserts it over device B's
+// edit, and never converges, because it wins its own merge every time.
+//
+// The stamp has exactly two possible authorities: the client can send the
+// column in its upsert payload (`user_preferences` does), or a `before update`
+// trigger can maintain it server-side (what `20250401000000` declares for the
+// three collection tables). A table with NEITHER is the defect, and it is
+// invisible from the client: nothing errors, nothing logs, the write reports
+// success, and every test passes because every database built from
+// `supabase/migrations` has the trigger. Production did not — LIFT-1397's
+// `db push` answered SQLSTATE 42704 for `trg_exercises_updated_at`, proving
+// that file never ran there — which is the whole lesson: **prod's schema is not
+// the migration history**, and the one database where this can be wrong is the
+// only one nothing looks at.
+//
+// So be clear about what this scan can and cannot do. It reads the DECLARED
+// schema, so it can only ever catch the next table added with no stamp
+// authority, or a trigger a migration suppresses and forgets to restore. It
+// cannot see production, and nothing in CI can — the repair for a catalog that
+// has drifted is a migration that assumes nothing it does not itself create
+// (`20260910000000_restore_updated_at_triggers.sql`). The layer in between —
+// "the corpus, applied to a real Postgres, produces a trigger that actually
+// FIRES" — is `supabaseIntegration.test.ts`, which is where a trigger attached
+// to a missing function or left DISABLED would show up.
+//
+// The subject is DERIVED from `remoteRows.ts` rather than listed here: a mapper
+// that builds an `updated_at` is by construction feeding the LWW merge, so a
+// future merged table is covered the day its mapper is written. Listing tables
+// would pin only the ones that existed today — the enumeration-drift class of
+// LIFT-1039 and #1357. `sets` is deliberately NOT in scope: `mapRemoteSet`
+// produces no `updated_at` (sets ride along inside their exercise's array, per
+// #1357), so its trigger is restored to match the declared history rather than
+// because a merge depends on it. `user_progression` is likewise out of scope —
+// its `updated_at` column is written by nobody and read by nobody (its merge is
+// a field-wise union, not LWW), so requiring a stamp for it would be a false
+// positive, and the derivation excludes it without needing an exemption.
+describe('Invariant: every merge timestamp has an authority that moves it (LIFT-1401)', () => {
+  const REMOTE_ROWS = readFileSync(join(SRC_DIR, 'lib', 'remoteRows.ts'), 'utf-8')
+
+  const migrationFiles = readdirSync(MIGRATIONS_DIR)
+    .filter(f => f.endsWith('.sql'))
+    .sort()
+    .map(f => ({ name: f, sql: stripSqlComments(readFileSync(join(MIGRATIONS_DIR, f), 'utf-8')) }))
+  const MIGRATION_SQL = migrationFiles.map(f => f.sql).join('\n')
+
+  /**
+   * Tables whose remote-row mapper builds an `updated_at` — i.e. the tables
+   * whose rows become `Timestamped` inputs to `mergeEntities`.
+   *
+   * The table name comes from the mapper's own `Tables<'…'>` parameter, so the
+   * two halves (which row shape, which merge input) are read off one
+   * declaration and cannot be paired wrongly here.
+   */
+  function mergeTimestampedTables(src: string): string[] {
+    const out = new Set<string>()
+    // Split on the export boundary so each mapper is inspected in isolation —
+    // a lazy scan across the file would let one mapper's `updated_at` vouch for
+    // the next one's table.
+    for (const chunk of src.split(/\bexport\s+function\s+/).slice(1)) {
+      const body = chunk.slice(0, chunk.indexOf('\n}\n') + 1 || undefined)
+      const table = /Tables<'(\w+)'>/.exec(body)
+      if (table && /\bupdated_at\b/.test(body)) out.add(table[1].toLowerCase())
+    }
+    return [...out]
+  }
+
+  /**
+   * Tables the migrations attach a `before update` → `update_updated_at_column`
+   * trigger to.
+   *
+   * Tokenized on `;` so a lazy run cannot stitch one table's `create trigger`
+   * onto another statement's `execute function` (the same isolation
+   * `policyStatements` needs). A trigger spelled some other way (`before insert
+   * or update`) is not matched — that direction fails LOUDLY as a reported
+   * violation rather than passing silently, which is the safe way for this scan
+   * to be wrong.
+   */
+  function triggerStampedTables(sql: string): Set<string> {
+    const re = new RegExp(
+      `create\\s+trigger\\s+\\w+\\s+before\\s+update\\s+on\\s+(?:only\\s+)?["']?${SCHEMA}(\\w+)["']?` +
+        `[\\s\\S]*?execute\\s+(?:function|procedure)\\s+update_updated_at_column\\s*\\(`,
+      'i',
+    )
+    const out = new Set<string>()
+    for (const stmt of sql.split(';')) {
+      const m = re.exec(stmt)
+      if (m) out.add(m[1].toLowerCase())
+    }
+    return out
+  }
+
+  /**
+   * `table.trigger` pairs a migration disables and never re-enables.
+   *
+   * Checked PER FILE because `db push` runs each migration in its own
+   * transaction: a suppression that leans on a later file to undo it leaves the
+   * trigger dead for however long that file takes to land — and, on a database
+   * that skipped the later file, forever. `20260909000000` suppresses
+   * `trg_exercises_updated_at` around its `bar_weight` backfill and re-enables
+   * it in the same file, which is the shape this keeps.
+   */
+  function triggersLeftDisabled(sql: string): string[] {
+    const pending = new Set<string>()
+    const pair = (verb: string) =>
+      new RegExp(`alter\\s+table\\s+(?:only\\s+)?["']?${SCHEMA}(\\w+)["']?\\s+${verb}\\s+trigger\\s+(\\w+)`, 'gi')
+    for (const m of sql.matchAll(pair('disable'))) pending.add(`${m[1].toLowerCase()}.${m[2].toLowerCase()}`)
+    for (const m of sql.matchAll(pair('enable'))) pending.delete(`${m[1].toLowerCase()}.${m[2].toLowerCase()}`)
+    return [...pending]
+  }
+
+  /** The first balanced `{`…`}` block after `marker`, re-anchored at `at`. */
+  function rowLiteral(source: string, marker: string, at: string): string {
+    const start = source.indexOf(marker)
+    if (start === -1) return ''
+    const from = source.indexOf(at, start + marker.length)
+    if (from === -1) return ''
+    const open = source.indexOf('{', from)
+    if (open === -1) return ''
+    let depth = 0
+    for (let i = open; i < source.length; i++) {
+      if (source[i] === '{') depth++
+      else if (source[i] === '}' && --depth === 0) return source.slice(open, i + 1)
+    }
+    return ''
+  }
+
+  /** Column keys in an upsert row literal, conditional spreads included. */
+  function columnKeys(literal: string): Set<string> {
+    const keys = new Set<string>()
+    for (const m of stripComments(literal).matchAll(/(?:^|[{,])\s*([a-z_][a-z0-9_]*)\s*:/gm)) keys.add(m[1])
+    return keys
+  }
+
+  /**
+   * The upsert producer that owns each table's row. Only the producer LIST is
+   * written here (the same granularity as LIFT-1039's and LIFT-1387's); the
+   * columns are derived from the source. `user_preferences` is present as the
+   * positive control — it is the one table that stamps client-side, so it
+   * proves the column scan can see an `updated_at` when there is one, and the
+   * merge-timestamped tables' empty result is not the scan silently failing.
+   */
+  const PRODUCERS: Record<string, { file: string; marker: string; at: string }> = {
+    exercises: { file: 'workout.ts', marker: 'function _buildExerciseUpsert', at: 'return {' },
+    sets: { file: 'workout.ts', marker: 'function _enqueueSetUpsert', at: 'const row = {' },
+    bodyweight_entries: { file: 'bodyweight.ts', marker: '_enqueueEntryUpsert(', at: 'const row = {' },
+    user_preferences: { file: 'preferences.ts', marker: '_persist() {', at: 'const row = {' },
+  }
+
+  const producerColumns = (table: string): Set<string> => {
+    const p = PRODUCERS[table]
+    if (!p) return new Set()
+    return columnKeys(rowLiteral(readFileSync(join(STORES_DIR, p.file), 'utf-8'), p.marker, p.at))
+  }
+
+  it('the scans find real mappers, triggers and row literals (non-vacuity)', () => {
+    // Every mapper that feeds the merge, and specifically not the one that
+    // doesn't — if this ever returned everything (or nothing) the invariant
+    // below would pass for the wrong reason.
+    const merged = mergeTimestampedTables(REMOTE_ROWS)
+    expect(merged).toContain('exercises')
+    expect(merged).toContain('bodyweight_entries')
+    expect(merged).not.toContain('sets')
+
+    // The trigger scan must discriminate between tables, not answer "yes" for
+    // every table in the corpus.
+    const stamped = triggerStampedTables(MIGRATION_SQL)
+    expect(stamped).toContain('exercises')
+    expect(stamped).toContain('bodyweight_entries')
+    expect(stamped).toContain('sets')
+    expect(stamped.has('user_preferences')).toBe(false)
+
+    // Each producer's real row literal, not a parameter type or an empty
+    // string. `user_preferences` is the positive control for `updated_at`.
+    expect(producerColumns('exercises')).toContain('bar_weight')
+    expect(producerColumns('sets')).toContain('estimated_1rm')
+    expect(producerColumns('bodyweight_entries')).toContain('weight')
+    expect(producerColumns('user_preferences')).toContain('updated_at')
+  })
+
+  it('flags a table with neither authority (self-test)', () => {
+    // The scans, run over SQL and a producer that omit both halves.
+    expect(triggerStampedTables('create trigger t before update on widgets for each row execute function other();')
+      .has('widgets')).toBe(false)
+    expect(columnKeys('{ id: x.id, user_id: u, ...(x.m ? { input_mode: x.m } : {}) }').has('updated_at')).toBe(false)
+    // …and the disable/enable pairing, in both directions.
+    expect(triggersLeftDisabled('alter table a disable trigger t;')).toEqual(['a.t'])
+    expect(triggersLeftDisabled('alter table a disable trigger t; update a set x = 1; alter table a enable trigger t;'))
+      .toEqual([])
+  })
+
+  it('every merge-timestamped table has a producer listed here', () => {
+    // A new LWW-merged table must not skip the producer half of the check by
+    // simply being absent from the map above.
+    const missing = mergeTimestampedTables(REMOTE_ROWS).filter(t => !PRODUCERS[t])
+    expect(missing, missing.join(', ') + ' map a remote `updated_at` into the ' +
+      'last-write-wins merge but name no upsert producer here, so nothing ' +
+      'checks whether the client stamps the column. Add the producer.',
+    ).toEqual([])
+  })
+
+  it('every merge-timestamped table is stamped by a trigger or by its producer', () => {
+    const stamped = triggerStampedTables(MIGRATION_SQL)
+    const violations: string[] = []
+    for (const table of mergeTimestampedTables(REMOTE_ROWS)) {
+      if (stamped.has(table)) continue
+      if (producerColumns(table).has('updated_at')) continue
+      violations.push(
+        `${table}.updated_at feeds the last-write-wins merge, but no client ` +
+          'upsert sends it and no migration attaches an ' +
+          '`update_updated_at_column()` trigger to the table. Its stamp is ' +
+          'then frozen at the INSERT-time `default now()` forever, every merge ' +
+          'is a tie, `mergeEntities` scores a tie as a LOCAL win, and a remote ' +
+          'edit can never win — the device that is behind re-upserts its stale ' +
+          'row over the other one and never converges (LIFT-1401). Attach the ' +
+          'trigger in a migration, or send the column from the producer.',
+      )
+    }
+    expect(violations).toEqual([])
+  })
+
+  it('a migration that disables a trigger re-enables it in the same file', () => {
+    const violations: string[] = []
+    for (const { name, sql } of migrationFiles) {
+      for (const pair of triggersLeftDisabled(sql)) {
+        violations.push(
+          `${name} disables ${pair} and never re-enables it. Each migration is ` +
+            'one transaction, so a suppression undone by a LATER file leaves ' +
+            'the trigger dead until that file lands — and dead forever on a ' +
+            'database that never applies it. Re-enable it in the same file.',
+        )
+      }
+    }
+    expect(violations).toEqual([])
+  })
+})
