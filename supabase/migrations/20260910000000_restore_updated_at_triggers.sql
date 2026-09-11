@@ -138,7 +138,12 @@ create trigger trg_bodyweight_entries_updated_at
 
 -- ── Indexes ───────────────────────────────────────────────────────────────────
 -- Same reasoning as the columns: declared by the file that never ran, so they
--- may be absent. `if not exists` makes this free where they are present.
+-- may be absent, and `if not exists` makes this free where they are present.
+-- They are NOT what fixes the bug — nothing in the client queries by
+-- `updated_at` (reads filter on `user_id` + `deleted_at`), and the delta-sync
+-- their original comment anticipated was never built. They are here for parity
+-- with the declared history, because partial parity is how this whole class of
+-- drift stays invisible.
 create index if not exists idx_exercises_updated_at on exercises(updated_at);
 create index if not exists idx_sets_updated_at on sets(updated_at);
 create index if not exists idx_bodyweight_entries_updated_at on bodyweight_entries(updated_at);

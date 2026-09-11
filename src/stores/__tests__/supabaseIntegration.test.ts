@@ -744,16 +744,30 @@ describeIntegration('Supabase integration: PostgREST query shape validation', ()
     async function stampOf(
       table: 'exercises' | 'sets' | 'bodyweight_entries',
       id: string,
-    ): Promise<number> {
+    ): Promise<string> {
       const { data, error } = await supabase
         .from(table as 'exercises')
         .select('updated_at')
         .eq('id', id)
         .single()
       expect(error).toBeNull()
-      const stamp = Date.parse(data!.updated_at)
-      expect(Number.isFinite(stamp)).toBe(true)
-      return stamp
+      expect(Number.isFinite(Date.parse(data!.updated_at))).toBe(true)
+      return data!.updated_at
+    }
+
+    /**
+     * The stamp moved, and moved FORWARD.
+     *
+     * Two assertions rather than one `Date.parse(after) > Date.parse(before)`:
+     * Postgres stores microseconds and `Date.parse` truncates to milliseconds,
+     * so a same-millisecond pair would fail a strict `>` even with a working
+     * trigger. The raw-string inequality is what proves the trigger fired (it
+     * sees the full precision); the parsed comparison only has to rule out a
+     * stamp that went backwards, so it can be inclusive.
+     */
+    function expectBumped(before: string, after: string): void {
+      expect(after).not.toBe(before)
+      expect(Date.parse(after)).toBeGreaterThanOrEqual(Date.parse(before))
     }
 
     it('bumps exercises.updated_at on an upsert that omits the column', async () => {
@@ -769,13 +783,13 @@ describeIntegration('Supabase integration: PostgREST query shape validation', ()
       const inserted = await stampOf('exercises', exerciseId)
 
       // The rename device B makes. Through PostgREST this is its own
-      // transaction, so `now()` is strictly later than the insert's.
+      // transaction, so `now()` is later than the insert's.
       const { error } = await supabase.from('exercises').upsert({
         id: exerciseId, user_id: userId, name: 'Incline Bench Press', tags: ['Push'],
       })
       expect(error).toBeNull()
 
-      expect(await stampOf('exercises', exerciseId)).toBeGreaterThan(inserted)
+      expectBumped(inserted, await stampOf('exercises', exerciseId))
     })
 
     it('bumps sets.updated_at and bodyweight_entries.updated_at too', async () => {
@@ -807,8 +821,8 @@ describeIntegration('Supabase integration: PostgREST query shape validation', ()
         id: entryId, user_id: userId, date: ts, weight: 178.5,
       })
 
-      expect(await stampOf('sets', setId)).toBeGreaterThan(setInserted)
-      expect(await stampOf('bodyweight_entries', entryId)).toBeGreaterThan(entryInserted)
+      expectBumped(setInserted, await stampOf('sets', setId))
+      expectBumped(entryInserted, await stampOf('bodyweight_entries', entryId))
     })
 
     it('bumps updated_at on the soft-delete UPDATE path as well', async () => {
@@ -829,7 +843,7 @@ describeIntegration('Supabase integration: PostgREST query shape validation', ()
         .eq('user_id', userId)
       expect(error).toBeNull()
 
-      expect(await stampOf('exercises', exerciseId)).toBeGreaterThan(inserted)
+      expectBumped(inserted, await stampOf('exercises', exerciseId))
     })
   })
 
