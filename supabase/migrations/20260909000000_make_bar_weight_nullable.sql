@@ -1,0 +1,64 @@
+-- Let `bar_weight` express "no explicit bar" (LIFT-1387).
+--
+-- `Exercise.barWeight` lives in the user's DISPLAY unit (LIFT-1211): a kg user
+-- stores a 20, a lbs user stores a 45. The column knew nothing about that, and
+-- neither did its default:
+--
+--   bar_weight real NOT NULL DEFAULT 45   -- 20260404200000_add_plate_loaded.sql
+--
+-- The client deliberately omits the column when the user has set no explicit
+-- bar, so Postgres applied that default on every insert and the read path
+-- adopted it unconditionally (it has no notion of a unit). Every exercise a kg
+-- user synced without touching the bar setting therefore came back holding an
+-- explicit 45 — a 45 kg bar, 99 lb — and `defaultBarWeight('kg')` (20) became
+-- unreachable for those rows. Signing in was enough to trigger it.
+--
+-- That is not just a display bug: `weightToPlates(100, 45, KG_PLATES)` says
+-- 27.5 per side where the real 20 kg bar wants 40. It decomposes cleanly, so
+-- there is no null, no empty state, and nothing on screen suggesting the bar is
+-- wrong. It also voided the premise `convertBarWeightsForUnitChange` is written
+-- on ("exercises with no explicit bar are skipped — they fall through to the
+-- unit-aware default"), since after one sync essentially no row had one.
+--
+-- "No explicit bar" is a real state the client already relies on, so the
+-- storage model should be able to hold it. Dropping the default is what makes
+-- the client's `bar_weight: null` (see `_buildExerciseUpsert`) round-trip as an
+-- absent `barWeight` through `mapRemoteExercise`'s finite-number guard.
+--
+-- `input_mode text NOT NULL DEFAULT 'numpad'` in the same original migration has
+-- the identical shape but is left alone on purpose: 'numpad' IS the client's own
+-- default and nothing distinguishes it from an absent value, so materializing it
+-- changes nothing. `bar_weight` is the only column whose default means a
+-- different physical thing in the two units.
+alter table exercises alter column bar_weight drop default;
+alter table exercises alter column bar_weight drop not null;
+
+-- Repair the rows the default already materialized.
+--
+-- A stored 45 is genuinely ambiguous — it is both the column default and a
+-- legitimate explicit lbs bar — but clearing it is lossless in BOTH units, which
+-- is why this can be a blanket backfill rather than one scoped to kg accounts
+-- (which would leave every lbs user broken the moment they toggled to kg):
+--
+--   * 45 IS `defaultBarWeight('lbs')`, so an lbs user falls back to the number
+--     they already had.
+--   * `convertBarWeight(45, 'lbs', 'kg')` snaps to 20, which IS
+--     `defaultBarWeight('kg')` — so a later unit toggle lands on the same value
+--     whether the bar was stored or defaulted. The round trip back is likewise
+--     `convertBarWeight(20, 'kg', 'lbs')` = 45.
+--
+-- The one case this cannot preserve is a kg user who deliberately typed 45 kg
+-- (a 99 lb bar, which no real equipment is); they fall back to 20 kg. That is
+-- the same value the overwhelmingly more likely reading — a materialized
+-- default — is being repaired to.
+--
+-- The updated_at trigger is suppressed for the backfill. Bumping every
+-- exercise's timestamp would hand the server the win in the next last-write-wins
+-- merge for rows where a device still holds an unflushed offline edit, reverting
+-- it. The repair does not need the bump: a synced exercise's server `updated_at`
+-- is already at or ahead of the local one (the server stamps at write time,
+-- after the client's), so the remote row wins the next merge anyway and the
+-- cleared value propagates to local state on its own.
+alter table exercises disable trigger trg_exercises_updated_at;
+update exercises set bar_weight = null where bar_weight = 45;
+alter table exercises enable trigger trg_exercises_updated_at;

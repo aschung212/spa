@@ -679,11 +679,23 @@
           </div>
           <!-- Bodyweight-loaded and the lifter's own bodyweight at this rep count
                already beats their best — no added weight to suggest (#1328).
-               Informational only: "add nothing" isn't a value the field can hold. -->
-          <div v-else-if="bodyweightBeatsPRTarget" class="repMaxResult repMaxResultTarget">
+               Tappable like every other to-beat card since LIFT-1330: "add
+               nothing" is now a value the field can hold, so the card loads its
+               own answer (0) instead of leaving the one target in the sheet that
+               the lifter has to translate by hand. -->
+          <div
+            v-else-if="bodyweightBeatsPRTarget"
+            class="repMaxResult repMaxResultTarget repMaxResultTappable"
+            role="button"
+            tabindex="0"
+            @click="loadBodyweightOnlyTarget"
+            @keydown.enter="loadBodyweightOnlyTarget"
+            @keydown.space.prevent="loadBodyweightOnlyTarget"
+          >
             <span class="repMaxResultLabel">{{ prTargetLabel }}</span>
             <span class="repMaxResultValue">Bodyweight × {{ reps }} 🏆</span>
             <span class="repMaxPersonalBest">Bodyweight alone at {{ reps }} rep{{ reps === 1 ? '' : 's' }} beats {{ isRecentBaseline ? 'your recent best' : 'your best' }} — no added weight needed</span>
+            <span class="repMaxPersonalBest">Tap to set added weight</span>
           </div>
           <div
             v-else-if="prTargetReps === 0"
@@ -751,8 +763,14 @@
             leave the user with no visible weight at all).
           -->
           <div class="wtInputRow logSetFieldsRow">
+            <!-- On a bodyweight-loaded exercise the field means ADDED weight, so
+                 it says so (LIFT-1330) — "Weight: 135" on a pull-up reads as if
+                 the lifter has to load something, which is how a plain
+                 bodyweight set came to look unloggable. The accessible name
+                 tracks the visible label rather than staying pinned to "Weight"
+                 (WCAG 2.5.3), and the placeholder drops the barbell-sized 135. -->
             <label :class="['repMaxLabel', 'logSetField', 'logSetFieldWeight', { logSetFieldActive: weightHasValue }]">
-              <span class="logSetFieldLabel">Weight <span class="logSetFieldLabelUnit">({{ weightUnit }})</span></span>
+              <span class="logSetFieldLabel">{{ weightFieldLabel }} <span class="logSetFieldLabelUnit">({{ weightUnit }})</span></span>
               <div class="logSetFieldValueRow">
                 <input
                   ref="weightInputEl"
@@ -761,9 +779,9 @@
                   inputmode="decimal"
                   enterkeyhint="next"
                   autocomplete="off"
-                  :placeholder="ghostArmed && nextRung ? String(displayWeight(nextRung.weightLbs)) : '135'"
+                  :placeholder="weightFieldPlaceholder"
                   class="repMaxInput logSetFieldInput"
-                  aria-label="Weight"
+                  :aria-label="weightFieldAriaLabel"
                 />
                 <button
                   v-if="weightHasValue"
@@ -1044,6 +1062,7 @@ import { platesToWeight, weightToPlates, defaultBarWeight, LBS_PLATES, KG_PLATES
 import { generateIntensityTable, DEFAULT_INTENSITY_MAX_REPS, type IntensityRow } from '../lib/intensityTable'
 import { applyStreakMultiplier, isExerciseEstablished, XP_CONFIG } from '../lib/xp'
 import { epley } from '../lib/epley'
+import { allowsZeroWeight, isLoggableWeight } from '../lib/bodyweightLoad'
 import { scoreSet } from '../lib/setScoring'
 import { useXPCeremony } from '../composables/useXPCeremony'
 import { computeWeeklyGoal } from '../lib/weeklyGoal'
@@ -2164,6 +2183,11 @@ function loadSinglePRTargetRep() {
   repsStr.value = '1'
 }
 
+/** `bodyweightBeatsPRTarget`'s payload: add nothing (LIFT-1330). */
+function loadBodyweightOnlyTarget() {
+  weightStr.value = '0'
+}
+
 const currentBarWeight = computed(() => {
   const ex = store.exercises.find(e => e.id === selectedExerciseId.value)
   if (ex?.barWeight !== undefined) return ex.barWeight
@@ -2200,6 +2224,68 @@ const bodyweightFoldLbs = computed(() => {
   return store.bodyweightFoldFor(id, editingSet.value?.setId)
 })
 
+/**
+ * The exercise the sheet is logging for — including in edit mode, where
+ * `selectedExerciseId` is the edited set's exercise.
+ */
+const selectedExercise = computed(() => store.exercises.find(e => e.id === selectedExerciseId.value))
+
+/**
+ * True when the weight field means ADDED weight, so 0 is a real value and the
+ * copy should say so (LIFT-1330). Keyed on the exercise's flag rather than on
+ * `bodyweightFoldLbs`, which is also 0 for a lifter who has never weighed in —
+ * the field still means "added" for them, and Save must not silently depend on
+ * a number entered in another tab.
+ */
+const isAddedWeightField = computed(() => allowsZeroWeight(selectedExercise.value))
+
+/** Visible label on the weight card, and the stem of its accessible name. */
+const weightFieldLabel = computed(() => (isAddedWeightField.value ? 'Added' : 'Weight'))
+
+/**
+ * Accessible name. Starts with the visible label so speech input can still
+ * address the field by what it reads (WCAG 2.5.3), but says "weight" too —
+ * "Added" alone, announced without the card around it, names nothing.
+ */
+const weightFieldAriaLabel = computed(() => (isAddedWeightField.value ? 'Added weight' : 'Weight'))
+
+/**
+ * "135" is a barbell's placeholder — on a pull-up it implies a load the lifter
+ * is supposed to add, which is half of why added-0 looked forbidden. "0" names
+ * the ordinary value instead. It stays a placeholder, not a default: an empty
+ * field is still empty (Save disabled), and that gap is what keeps the
+ * "what should I add?" to-beat card on screen.
+ */
+const weightFieldPlaceholder = computed(() => {
+  if (ghostArmed.value && nextRung.value) return String(displayWeight(nextRung.value.weightLbs))
+  return isAddedWeightField.value ? '0' : '135'
+})
+
+/**
+ * The weight floor, in one place (LIFT-1330). LIFT-834 built bodyweight-loaded
+ * exercises so "a pure-bodyweight rep at added = 0 still scores", and the store
+ * scored it correctly from day one — but every gate in this sheet hand-rolled
+ * `weight > 0`, so the single most common set the feature exists to record (a
+ * plain pull-up) could never be entered. The lifter's choices were to skip it or
+ * to log a fake 1 lb, which then poisons the ladder clustering, `bestWeightAtReps`
+ * and the overload nudge with a rung nobody actually loaded.
+ *
+ * Empty stays distinct from an explicit 0: `weight` is null for an untouched
+ * field, which is what keeps the "what should I add?" to-beat card alive.
+ */
+const weightIsLoggable = computed(() => isLoggableWeight(weight.value, selectedExercise.value))
+
+/**
+ * The load (lbs) a set typed into the fields right now would put on the lifter —
+ * the ADDED weight plus the fold. Zero only when nothing is entered or a
+ * bodyweight-loaded exercise has no bodyweight on record; the surfaces that need
+ * a real load to say anything (the 1RM estimate, the reps-to-beat card) gate on
+ * THIS rather than on the field, so an added-0 set is describable while a
+ * genuinely zero load stays silent instead of dividing by it.
+ */
+const typedLoadLbs = computed(() =>
+  weightIsLoggable.value ? toLbs(weight.value!) + bodyweightFoldLbs.value : 0,
+)
 
 const activeDenominations = computed(() =>
   weightUnit.value === 'kg' ? KG_PLATES : LBS_PLATES
@@ -2793,8 +2879,12 @@ function openRestTimer() {
 // a ~29 lb estimated 1RM against a stored PR of ~216, so the badge below could
 // never fire no matter how heavy the set.
 const liveEstimateLbs = computed<number | null>(() => {
-  if (!weight.value || weight.value <= 0 || !reps.value || reps.value < 1) return null
-  return epley(toLbs(weight.value) + bodyweightFoldLbs.value, reps.value)
+  if (!weightIsLoggable.value || !reps.value || reps.value < 1) return null
+  // Gated on the folded load, not the field: an added-0 pull-up is a real set
+  // (LIFT-1330) and estimates fine, while an added-0 set on an exercise with no
+  // bodyweight on record carries no load at all and has nothing to estimate.
+  if (typedLoadLbs.value <= 0) return null
+  return epley(typedLoadLbs.value, reps.value)
 })
 
 const liveEstimate = computed(() =>
@@ -2822,8 +2912,11 @@ const isNewPR = computed(() => {
 // weight to suggest).
 const prTargetAddedLbs = computed<number | null>(() => {
   if (isEditMode.value || !reps.value || reps.value < 1) return null
-  // Show PR suggestion when weight is empty; show live estimate when weight is filled
-  if (weight.value && weight.value > 0) return null
+  // Show PR suggestion when the weight axis is still open; show the live
+  // estimate once it is filled. An explicit 0 on a bodyweight-loaded exercise
+  // counts as filled (LIFT-1330) — the answer to "what should I add?" is the
+  // number already in the field.
+  if (weightIsLoggable.value) return null
   const id = selectedExerciseId.value
   if (!id || id === '__new__') return null
   const pr = store.getExercisePR(id, prBaselineDate.value)
@@ -2918,7 +3011,7 @@ watch(
   () => {
     clearTimeout(_xpPreviewTimer)
     // Fast-clear when inputs are obviously invalid (no flicker of stale data)
-    if (!weight.value || weight.value <= 0 || !reps.value || reps.value < 1) {
+    if (!weightIsLoggable.value || !reps.value || reps.value < 1) {
       liveXPPreview.value = null
       return
     }
@@ -2927,15 +3020,18 @@ watch(
 )
 
 const prTargetReps = computed<number | null>(() => {
-  if (isEditMode.value || !weight.value || weight.value <= 0) return null
+  if (isEditMode.value || !weightIsLoggable.value) return null
   if (reps.value && reps.value >= 1) return null // both filled
   const id = selectedExerciseId.value
   if (!id || id === '__new__') return null
   const pr = store.getExercisePR(id, prBaselineDate.value)
   if (pr <= 0) return null
   // The PR is an effective load, so the typed ADDED weight has to be folded
-  // before it can be compared against it (#1328).
-  const wLbs = toLbs(weight.value) + bodyweightFoldLbs.value
+  // before it can be compared against it (#1328). An added-0 set with no
+  // bodyweight on record carries no load, and "how many reps at nothing beats
+  // your PR" divides by zero — there is no answer to offer (LIFT-1330).
+  const wLbs = typedLoadLbs.value
+  if (wLbs <= 0) return null
   // Account for Epley rounding: round(w * (1 + r/30)) > pr triggers at pr + 0.5
   if (Math.round(wLbs) > pr) return 0 // any rep beats it (1RM at this weight already exceeds PR)
   const needed = Math.ceil(30 * ((pr + 0.5) / wLbs - 1))
@@ -2982,14 +3078,16 @@ function lensLabel(lens: SuggestionLens): string {
 const suggestionHeaderSub = computed(() => suggestionLenses.value.map(lensLabel).join(' · '))
 
 // ── Personal bests from actual history ──────────────────────────
-// Best reps at the entered weight (exact match in lbs)
+// Best reps at the entered weight (exact match in lbs). Added-0 matches the
+// exercise's own pure-bodyweight sets, so "your best at 0 lbs: 12 reps" is the
+// rep PR to chase on a plain pull-up (LIFT-1330).
 const bestRepsAtWeight = computed<number | null>(() => {
-  if (!weight.value || weight.value <= 0) return null
+  if (!weightIsLoggable.value) return null
   const id = selectedExerciseId.value
   if (!id || id === '__new__') return null
   const exercise = store.exercises.find(e => e.id === id)
   if (!exercise) return null
-  const wLbs = Math.round(toLbs(weight.value))
+  const wLbs = Math.round(toLbs(weight.value!))
   let best = 0
   for (const s of exercise.sets) {
     if (Math.round(s.weight) === wLbs && s.reps > best) best = s.reps
@@ -3011,7 +3109,7 @@ const bestWeightAtReps = computed<number | null>(() => {
   return best > 0 ? best : null
 })
 
-const hasSetData = computed(() => weight.value !== null && weight.value > 0 && weight.value <= MAX_WEIGHT && reps.value !== null && reps.value >= 1 && reps.value <= MAX_REPS)
+const hasSetData = computed(() => weightIsLoggable.value && weight.value! <= MAX_WEIGHT && reps.value !== null && reps.value >= 1 && reps.value <= MAX_REPS)
 
 const canSave = computed(() => {
   if (isEditMode.value) return hasSetData.value

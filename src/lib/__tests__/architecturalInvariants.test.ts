@@ -20,6 +20,7 @@ import { readFileSync, readdirSync } from 'fs'
 import { join, relative, resolve } from 'path'
 import { fileURLToPath } from 'url'
 import { dirname } from 'path'
+import { notNullColumns } from '../../__tests__/migrationSchema'
 
 // ── Shared helpers ──────────────────────────────────────────────────
 
@@ -1377,6 +1378,136 @@ describe('Invariant: REPLAYABLE_COLUMNS stays in lockstep with its producers (LI
   })
 })
 
+// ── Invariant: an always-send `?? null` column is nullable in SQL (LIFT-1387) ──
+
+describe('Invariant: every always-send NULL column is nullable in the migrations (LIFT-1387)', () => {
+  /**
+   * `_buildExerciseUpsert` sends most of its columns unconditionally, using
+   * `?? null` to mean "the user cleared this / never set it". That only works
+   * if the column can actually hold a NULL — otherwise every exercise write
+   * fails with SQLSTATE 23502, and it fails as a RESOLVED `{ error }` rather
+   * than a rejection (LIFT-1321), so nothing throws and the local-first UI
+   * shows the write as saved.
+   *
+   * `bar_weight` reached that shape in LIFT-1387: it had to become nullable in
+   * the same commit that started sending `null` for it, because its
+   * `NOT NULL DEFAULT 45` was what invented a 45 **kg** bar for every kg user
+   * in the first place. The two halves are one change, and this is what keeps
+   * them one change — a revert of either side alone fails here.
+   *
+   * The fake Supabase models column DEFAULTs but not NOT NULL constraints
+   * (teaching it those would reject half the suite's partial-payload fixtures
+   * for unrelated reasons), so a static check is the guard that fits. It is
+   * derived from both sources: the payload's `?? null` columns come out of the
+   * store, the nullability out of the migration corpus, and neither is listed
+   * here.
+   */
+  const WORKOUT_STORE_SRC = readFileSync(join(STORES_DIR, 'workout.ts'), 'utf-8')
+
+  /**
+   * The first balanced `{`…`}` block following `marker` ('' if absent).
+   *
+   * `at` re-anchors the search inside the marker's region, which is required
+   * rather than decorative: `_enqueueSetUpsert` destructures a typed parameter,
+   * so the first `{` after its name opens the PARAMETER TYPE, not the row
+   * literal — a scan that took it would quietly cover the wrong block and
+   * report clean.
+   */
+  function bodyAfter(source: string, marker: string, at = '{'): string {
+    const start = source.indexOf(marker)
+    if (start === -1) return ''
+    const anchor = source.indexOf(at, start + marker.length)
+    if (anchor === -1) return ''
+    const from = source.indexOf('{', anchor)
+    if (from === -1) return ''
+    let depth = 0
+    for (let i = from; i < source.length; i++) {
+      if (source[i] === '{') depth++
+      else if (source[i] === '}' && --depth === 0) return source.slice(from, i + 1)
+    }
+    return ''
+  }
+
+  /**
+   * Columns a producer sends as `col: <expr> ?? null`.
+   *
+   * Scanned per LINE rather than with one expression spanning the payload:
+   * every column in these row literals is its own line, and a line-anchored
+   * match can't be thrown off by a comma or brace inside the value expression
+   * (`foo: pick(a, b) ?? null`). A guard that silently stops seeing a column is
+   * worse than no guard.
+   */
+  function nullableSendColumns(source: string, marker: string, at?: string): string[] {
+    const cols: string[] = []
+    for (const line of stripComments(bodyAfter(source, marker, at)).split('\n')) {
+      const m = line.match(/^\s*([a-z_][a-z0-9_]*)\s*:.*\?\?\s*null\s*,?\s*$/)
+      if (m) cols.push(m[1])
+    }
+    return cols
+  }
+
+  /** Every table→producer pair whose upsert payload the client owns. */
+  const PRODUCERS = [
+    { table: 'exercises', marker: 'function _buildExerciseUpsert', at: 'return {' },
+    { table: 'sets', marker: 'function _enqueueSetUpsert', at: 'const row = {' },
+  ] as const
+
+  it('the scan reaches each producer’s real row literal (non-vacuity)', () => {
+    // Every column the producers send, `?? null` or not — proves `bodyAfter`
+    // landed on the row literal rather than on a parameter type or an empty
+    // string, for BOTH producers. Without this the sets half would report clean
+    // while scanning `{ id: string; date: string; … }`.
+    const lines = (marker: string, at: string) =>
+      stripComments(bodyAfter(WORKOUT_STORE_SRC, marker, at))
+    expect(lines('function _buildExerciseUpsert', 'return {')).toContain('plate_count_mode')
+    expect(lines('function _enqueueSetUpsert', 'const row = {')).toContain('estimated_1rm')
+    // …and specifically NOT the destructured parameter type the naive anchor
+    // would have hit, whose declarations are the only `id: string` in scope.
+    expect(lines('function _enqueueSetUpsert', 'const row = {')).not.toContain('id: string')
+    expect(bodyAfter(WORKOUT_STORE_SRC, 'function _enqueueSetUpsert')).toContain('id: string')
+  })
+
+  it('the scan finds the exercise upsert’s NULL-sending columns (non-vacuity)', () => {
+    const cols = nullableSendColumns(WORKOUT_STORE_SRC, 'function _buildExerciseUpsert', 'return {')
+    // Anchors that must be present however the payload is spelled — if the
+    // extractor silently stopped matching, the invariant below would pass by
+    // scanning nothing.
+    expect(cols).toContain('bar_weight')
+    expect(cols).toContain('archived_at')
+    expect(cols).toContain('notes')
+    expect(cols.length).toBeGreaterThanOrEqual(5)
+    // Columns that default to something OTHER than null must not be swept in.
+    expect(cols).not.toContain('gyms')
+    expect(cols).not.toContain('bodyweight_loaded')
+  })
+
+  it('the scan reads nullability out of the migrations (non-vacuity)', () => {
+    // `name` is NOT NULL from the initial schema and nothing has relaxed it;
+    // `bar_weight` was NOT NULL until LIFT-1387 relaxed it.
+    expect(notNullColumns('exercises').has('name')).toBe(true)
+    expect(notNullColumns('exercises').has('bar_weight')).toBe(false)
+    expect(notNullColumns('sets').has('estimated_1rm')).toBe(true)
+  })
+
+  it('no column sent as `?? null` is declared NOT NULL', () => {
+    const violations: string[] = []
+    for (const { table, marker, at } of PRODUCERS) {
+      const notNull = notNullColumns(table)
+      for (const col of nullableSendColumns(WORKOUT_STORE_SRC, marker, at)) {
+        if (!notNull.has(col)) continue
+        violations.push(
+          `${marker} sends ${table}.${col} as \`?? null\`, but the migrations ` +
+            'declare it NOT NULL. Postgres answers that with SQLSTATE 23502, ' +
+            'which postgrest-js RESOLVES as { error } rather than rejecting — ' +
+            'so every write through this producer fails silently. Relax the ' +
+            'column in a migration in the same commit.',
+        )
+      }
+    }
+    expect(violations).toEqual([])
+  })
+})
+
 // ── Invariant: every RPC the client calls exists in a migration (#1299) ──
 // Guard: an `.rpc('name')` argument is a plain string, so a rename on either
 // side — or a caller added ahead of its migration — typechecks, lints, and
@@ -1830,5 +1961,162 @@ describe('Invariant: every custom role="button" is keyboard-operable (LIFT-1305)
     }
 
     expect(violations).toEqual([])
+  })
+})
+
+// ── Invariant: every WorkoutSet field is synced or preserved (#1357) ─
+//
+// A `WorkoutSet` field is in one of exactly two states, and there is no third:
+// either the `sets` table has a column for it (so `_enqueueSetUpsert` sends it
+// and `mapRemoteSet` reads it back), or it lives on the device only and must be
+// carried across a merge by `LOCAL_ONLY_SET_FIELDS`.
+//
+// `rpe` (#617) and `bodyweight` (LIFT-834) shipped in neither. `mergeEntities`
+// picks an exercise wholesale by last-write-wins, sets and all, and the union
+// after it only adds sets the winner is MISSING — so when the remote row won (a
+// rename on a second device is enough), every set present on both sides was
+// replaced by the server's copy of itself, and the two fields the server cannot
+// carry were gone. Silent, routine, and committed to localStorage, so the next
+// cold start loaded the stripped copy.
+//
+// Derived rather than enumerated because the failure is an OMISSION: adding an
+// optional field to `WorkoutSet` is a one-line edit, and nothing about it
+// prompts the author to think about a merge three files away. Deriving both
+// sides means a new field has to be given one of the two homes or this fails.
+describe('Invariant: every WorkoutSet field is synced or locally preserved (#1357)', () => {
+  const WORKOUT_STORE = readFileSync(join(STORES_DIR, 'workout.ts'), 'utf-8')
+  const REMOTE_ROWS = readFileSync(join(SRC_DIR, 'lib/remoteRows.ts'), 'utf-8')
+  const PRESERVER = readFileSync(join(SRC_DIR, 'lib/localOnlySetFields.ts'), 'utf-8')
+
+  /** Property names declared in `export interface <name> { … }`, comments stripped. */
+  function interfaceFields(source: string, name: string): Set<string> {
+    const start = source.indexOf(`export interface ${name} {`)
+    if (start === -1) return new Set()
+    const from = source.indexOf('{', start)
+    let depth = 0
+    let end = -1
+    for (let i = from; i < source.length; i++) {
+      if (source[i] === '{') depth++
+      else if (source[i] === '}' && --depth === 0) { end = i; break }
+    }
+    const body = stripComments(source.slice(from + 1, end))
+    return new Set([...body.matchAll(/^\s*([A-Za-z_$][\w$]*)\??\s*:/gm)].map(m => m[1]))
+  }
+
+  /** Domain keys the given mapper assigns from a remote row. */
+  function mappedFields(source: string, marker: string): Set<string> {
+    const start = source.indexOf(marker)
+    if (start === -1) return new Set()
+    const body = stripComments(source.slice(start, source.indexOf('\n}', start)))
+    return new Set([...body.matchAll(/^\s*([A-Za-z_$][\w$]*)\s*:/gm)].map(m => m[1]))
+  }
+
+  /** Members of the `LOCAL_ONLY_SET_FIELDS` tuple. */
+  function preservedFields(): Set<string> {
+    const decl = PRESERVER.slice(PRESERVER.indexOf('export const LOCAL_ONLY_SET_FIELDS'))
+    const literal = decl.slice(decl.indexOf('['), decl.indexOf(']') + 1)
+    return new Set((literal.match(/'[\w$]+'/g) ?? []).map(q => q.slice(1, -1)))
+  }
+
+  it('the extractors read real declarations (non-vacuity)', () => {
+    const fields = interfaceFields(WORKOUT_STORE, 'WorkoutSet')
+    // Anchors on both sides of the split, so neither extractor can go empty and
+    // report green over a rule it never actually evaluated.
+    for (const f of ['id', 'date', 'weight', 'reps', 'estimated1RM', 'rpe', 'bodyweight']) {
+      expect(fields.has(f)).toBe(true)
+    }
+    // A JSDoc'd field must survive comment stripping — `createdAt` and
+    // `bodyweight` both carry multi-line blocks that name other fields.
+    expect(fields.has('createdAt')).toBe(true)
+    expect(mappedFields(REMOTE_ROWS, 'export function mapRemoteSet').has('estimated1RM')).toBe(true)
+    expect(preservedFields()).toEqual(new Set(['rpe', 'bodyweight']))
+  })
+
+  it('the derivation flags a field that is neither synced nor preserved (self-test)', () => {
+    const source = [
+      'export interface Fake {',
+      '  id: string',
+      '  /** A comment naming rpe: 9 must not register as a field. */',
+      '  tempo?: number',
+      '}',
+    ].join('\n')
+    const fields = interfaceFields(source, 'Fake')
+    expect(fields).toEqual(new Set(['id', 'tempo']))
+    expect([...fields].filter(f => !new Set(['id']).has(f))).toEqual(['tempo'])
+  })
+
+  it('no WorkoutSet field is both un-synced and unpreserved', () => {
+    const mapped = mappedFields(REMOTE_ROWS, 'export function mapRemoteSet')
+    const preserved = preservedFields()
+    const orphans = [...interfaceFields(WORKOUT_STORE, 'WorkoutSet')]
+      .filter(f => !mapped.has(f) && !preserved.has(f))
+
+    expect(orphans, orphans.length === 0 ? '' :
+      `WorkoutSet.${orphans.join(', WorkoutSet.')} round-trips through neither ` +
+      'Supabase (mapRemoteSet) nor LOCAL_ONLY_SET_FIELDS, so a remote-winning ' +
+      'merge silently erases it for every set that exists on both sides ' +
+      '(#1357). Give it a `sets` column, or add it to LOCAL_ONLY_SET_FIELDS.',
+    ).toEqual([])
+  })
+
+  it('nothing is listed as local-only that the sync path actually carries', () => {
+    // The mirror failure: once a field gains a column, remote-wins has to keep
+    // meaning remote-wins, so it must leave the preserved list in the same
+    // commit — restore would otherwise re-attach a stale local value.
+    const mapped = mappedFields(REMOTE_ROWS, 'export function mapRemoteSet')
+    expect([...preservedFields()].filter(f => mapped.has(f))).toEqual([])
+  })
+})
+
+/**
+ * `ExercisePickerModal` owns the "Choose Exercise" sheet. CalendarView shipped a
+ * hand-rolled copy of its markup, and the copy drifted the way copies do: it
+ * listed `store.exercises` raw, so an exercise archived on the Workouts tab
+ * still offered itself here, and it never grew the "+ New exercise" row the
+ * original added — leaving a user with no exercises a modal with an empty body
+ * and only Cancel (LIFT-1375).
+ *
+ * No behavioural test could catch that: a spec for the component only ever
+ * mounts the component, and a spec for the copy asserts the copy's own
+ * behaviour. The guard has to be structural — the picker's row markup may
+ * appear in exactly one file, so a second host is forced through the props and
+ * emits the first one already defines.
+ */
+describe('Invariant: the exercise picker has one implementation (LIFT-1375)', () => {
+  const PICKER = join('components', 'ExercisePickerModal.vue')
+  const ROW_CLASS = 'wtExPickerRow'
+
+  const pickerVueFiles = () => getSourceFiles().filter(f => f.path.endsWith('.vue'))
+
+  it('finds the picker and its row markup (non-vacuity)', () => {
+    const picker = pickerVueFiles().find(f => f.path === PICKER)
+    expect(picker, PICKER + " is the picker's one implementation").toBeDefined()
+    expect(picker!.content).toContain(ROW_CLASS)
+  })
+
+  it('is reached by every host through the component, not a copy', () => {
+    const hosts = pickerVueFiles()
+      .filter(f => f.path !== PICKER && /import\s+ExercisePickerModal\s+from/.test(f.content))
+      .map(f => f.path)
+
+    // Both logging surfaces: the Workouts tab's quick-log picker and the
+    // Calendar tab's backfill picker. If either drops out, the scan below
+    // passes vacuously.
+    expect(hosts).toContain(join('components', 'WorkoutTracker.vue'))
+    expect(hosts).toContain(join('views', 'CalendarView.vue'))
+  })
+
+  it('renders the picker rows in exactly one file', () => {
+    const copies = pickerVueFiles()
+      .filter(f => f.path !== PICKER && stripComments(f.content).includes(ROW_CLASS))
+      .map(f => f.path)
+
+    expect(copies, copies.length === 0 ? '' :
+      copies.join(', ') + ' render .' + ROW_CLASS + ' markup of their own instead ' +
+      'of using ExercisePickerModal. A second copy of this sheet drifts from the ' +
+      "first — the calendar's leaked archived exercises and lost the " +
+      '"+ New exercise" row (LIFT-1375). Import the component, bind `exercises`, ' +
+      'and handle `select` + `create-new` instead.',
+    ).toEqual([])
   })
 })

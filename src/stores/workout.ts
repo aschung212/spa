@@ -19,6 +19,8 @@ import { sanitizeExerciseNotes } from '../lib/inputLimits'
 import { sanitizeExerciseEquipment, type ExerciseEquipment } from '../lib/coachAnalytics'
 import { sanitizeExerciseGyms } from '../lib/gyms'
 import { mapRemoteExercise, mapRemoteSet } from '../lib/remoteRows'
+import { captureLocalOnlySetFields, restoreLocalOnlySetFields } from '../lib/localOnlySetFields'
+import { mergeExerciseMetadata } from '../lib/exerciseMerge'
 import { fetchAllRows } from '../lib/supabasePagination'
 import { bodyweightFold, effectiveSetWeight } from '../lib/bodyweightLoad'
 import { attemptedNextRep, pickTopSet } from '../lib/setEffort'
@@ -143,6 +145,10 @@ export function deduplicateSets(sets: WorkoutSet[]): { unique: WorkoutSet[]; rem
  * Deduplicate exercises by name (case-insensitive).
  * For each group of exercises with the same name, keeps the one with
  * the most sets as primary and merges all other sets into it.
+ *
+ * Every non-set field is resolved by `EXERCISE_MERGE_RULES` (LIFT-1369) — see
+ * `src/lib/exerciseMerge.ts` for the policy and why it is a total map over
+ * `keyof Exercise` rather than a hand-written list.
  */
 export function deduplicateByName(exercises: Exercise[]): { exercises: Exercise[]; removed: Exercise[] } {
   const groups = new Map<string, Exercise[]>()
@@ -195,19 +201,15 @@ export function deduplicateByName(exercises: Exercise[]): { exercises: Exercise[
     // timestamp would randomly shuffle same-day sets. JS sort is stable,
     // so same-day sets preserve their array insertion order (= logged order).
     primary.sets.sort((a, b) => a.date.slice(0, 10).localeCompare(b.date.slice(0, 10)))
-    // Merge tags from duplicates
-    const tagSet = new Set(primary.tags)
-    for (let i = 1; i < group.length; i++) {
-      for (const tag of group[i].tags) tagSet.add(tag)
-    }
-    primary.tags = [...tagSet]
-    // Merge gym membership the same way so a cross-device duplicate's gym
-    // assignments aren't silently dropped when its row is absorbed (#961).
-    const gymSet = new Set(primary.gyms ?? [])
-    for (let i = 1; i < group.length; i++) {
-      for (const gym of group[i].gyms ?? []) gymSet.add(gym)
-    }
-    if (gymSet.size > 0) primary.gyms = [...gymSet]
+    // Merge every remaining field per `EXERCISE_MERGE_RULES` (LIFT-1369): tags
+    // and gyms union, and the seven per-exercise config fields fill a gap on the
+    // primary from the first duplicate that has one. Only tags and gyms were
+    // ever merged, so an absorbed row's note, bar weight, equipment and
+    // bodyweight-loaded flag were dropped on every fetch — including the flag
+    // its OWN incoming sets need, without which their folded e1RM contradicts
+    // the volume they report. Display-only: nothing is written back to the
+    // absorbed row and `updated_at` is not bumped (2026-04-12 SEV1).
+    mergeExerciseMetadata(primary, group.slice(1))
     result.push(primary)
   }
 
@@ -384,7 +386,14 @@ export const useWorkoutStore = defineStore('workout', () => {
       tags: exercise.tags,
       archived_at: exercise.archived_at ?? null,
       ...(exercise.inputMode ? { input_mode: exercise.inputMode } : {}),
-      ...(exercise.barWeight != null ? { bar_weight: exercise.barWeight } : {}),
+      // Always send bar_weight — null means "no explicit bar", which is a real
+      // state the plate math depends on (it falls through to the unit-aware
+      // `defaultBarWeight`). Omitting it used to let the column's own
+      // `NOT NULL DEFAULT 45` fill the gap on insert, so a kg user's untouched
+      // exercise came back holding a 45 **kg** bar and the fallback became
+      // unreachable (LIFT-1387). Requires the nullable column from
+      // 20260909000000_make_bar_weight_nullable.sql.
+      bar_weight: exercise.barWeight ?? null,
       // Always send plate_count_mode (null = client default 'per-side') so a
       // switch back to the default propagates instead of leaving a stale value
       // that re-applies on the next fetch (LIFT-783).
@@ -613,6 +622,12 @@ export const useWorkoutStore = defineStore('workout', () => {
       ex.sets = remoteSetsMap.get(ex.id) || []
     })
 
+    // Index the per-set fields the server has no column for, BEFORE the merge
+    // can hand a set's slot to the remote copy of itself (#1357). Keyed by set
+    // id, so it survives however the merge and the two dedup passes below
+    // reshuffle sets between exercises.
+    const localOnlySetFields = captureLocalOnlySetFields(exercises.value)
+
     // Merge with local state using last-write-wins conflict resolution
     // (#1 fix: local exercises now carry updated_at from mutations)
     const localWithTimestamps = exercises.value.map(ex => ({
@@ -670,6 +685,13 @@ export const useWorkoutStore = defineStore('workout', () => {
       const { unique } = deduplicateSets(ex.sets)
       ex.sets = unique
     }
+
+    // Re-attach RPE and captured bodyweight to any set that arrived from the
+    // server (#1357). Runs after BOTH dedup passes so it covers every set about
+    // to be committed, not just the ones the last-write-wins union touched —
+    // the alternative, patching the union loop alone, would leave the same hole
+    // open for any future path that adopts a remote set.
+    restoreLocalOnlySetFields(deduped.exercises, localOnlySetFields)
 
     exercises.value = deduped.exercises
     _invalidateDayCounts()

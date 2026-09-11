@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import { getLocalStorageMock, mockAnalytics, mockWeightUnit } from '../../__tests__/helpers'
+import { bodyweightFold } from '../../lib/bodyweightLoad'
+import { epley } from '../../lib/epley'
 
 const localStorageMock = getLocalStorageMock()
 
@@ -26,7 +28,13 @@ interface MockExercise {
   name: string
   tags: string[]
   sets: MockSet[]
+  bodyweightLoaded?: boolean
+  archived_at?: string | null
 }
+
+// The lifter's tracked bodyweight, as the real store's `_currentBodyweight()`
+// would read it (LIFT-834).
+let bodyweightLbs: number | null = null
 
 let exercises: MockExercise[] = []
 
@@ -42,13 +50,26 @@ function getAllTags(): string[] {
   return [...tags].sort()
 }
 
+const mockLogSet = vi.fn()
+
+// Delegates to the REAL fold helper so the mock can't invent its own rule about
+// when bodyweight counts — the same fidelity contract the WorkoutTracker
+// harness holds itself to (#1328).
+function bodyweightFoldFor(id: string): number {
+  return bodyweightFold(exercises.find(e => e.id === id), bodyweightLbs)
+}
+
 vi.mock('../../stores/workout', () => ({
   useWorkoutStore: () => ({
     get exercises() { return exercises },
     set exercises(v: MockExercise[]) { exercises = v },
+    // Derived exactly as the real store derives it, so the picker can't pass
+    // here while leaking archived rows in the app (LIFT-1375).
+    get activeExercises() { return exercises.filter(e => !e.archived_at) },
     get allTags() { return getAllTags() },
     getExercisePR,
-    logSet: vi.fn(),
+    bodyweightFoldFor,
+    logSet: mockLogSet,
     addExercise: vi.fn(),
     tagRecoveryDays: {},
     tagRecoveryExcluded: [],
@@ -63,6 +84,13 @@ function mountCalendar() {
       stubs: { Teleport: true },
     }
   })
+}
+
+// The local day key the calendar renders as "today" — built the same way the
+// existing specs build theirs, never via toISOString() (#746).
+function todayKey(): string {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
 // Create exercise data with sets on specific dates
@@ -84,6 +112,8 @@ function makeExercises(dates: string[]): MockExercise[] {
 describe('CalendarView', () => {
   beforeEach(() => {
     exercises = []
+    bodyweightLbs = null
+    mockLogSet.mockClear()
     localStorageMock.clear()
   })
 
@@ -574,9 +604,9 @@ describe('CalendarView', () => {
 
       const dialog = wrapper.find('[role="dialog"]')
       expect(dialog.exists()).toBe(true)
-      expect(dialog.attributes('aria-labelledby')).toBe('exercise-picker-title')
-      expect(wrapper.find('#exercise-picker-title').exists()).toBe(true)
-      expect(wrapper.find('#exercise-picker-title').text()).toBe('Choose Exercise')
+      expect(dialog.attributes('aria-labelledby')).toBe('calendar-picker-title')
+      expect(wrapper.find('#calendar-picker-title').exists()).toBe(true)
+      expect(wrapper.find('#calendar-picker-title').text()).toBe('Choose Exercise')
     })
 
     it('week view log buttons have aria-labels', async () => {
@@ -700,6 +730,155 @@ describe('CalendarView', () => {
 
       await wrapper.findAll('.calToggleBtn')[0].trigger('click')
       expect(wrapper.find('.wtTagFilterBar').exists()).toBe(false)
+    })
+  })
+
+  /**
+   * The calendar's "+ Log" is the app's SECOND way to log a set — backfilling a
+   * day you forgot — and it carried its own hand-rolled copy of the log sheet's
+   * `weight > 0` gate, so fixing only the sheet would have left the pure
+   * bodyweight set (LIFT-1330) refused here. Its estimate was also still
+   * unfolded, the #1328 defect surviving in a surface that issue never touched:
+   * a bodyweight-loaded pull-up read ~29 lbs on screen while `logSet` was about
+   * to store ~216.
+   */
+  describe('backfill log modal, bodyweight-loaded (LIFT-1330)', () => {
+    const BODYWEIGHT = 160
+
+    async function openLogModalFor(name: string) {
+      const wrapper = mountCalendar()
+      await wrapper.find('.calCellToday').trigger('click')
+      await wrapper.find('.calLogBtn').trigger('click')
+      await wrapper.findAll('.wtExPickerRow').find(b => b.text().includes(name))!.trigger('click')
+      return wrapper
+    }
+
+    function fields(wrapper: ReturnType<typeof mountCalendar>) {
+      const inputs = wrapper.findAll('[aria-labelledby="cal-modal-title"] input')
+      return { weight: inputs[0], reps: inputs[1] }
+    }
+
+    const saveBtn = (wrapper: ReturnType<typeof mountCalendar>) =>
+      wrapper.find('[aria-labelledby="cal-modal-title"] .repMaxBtnCalc')
+
+    beforeEach(() => {
+      bodyweightLbs = BODYWEIGHT
+      exercises = [{ id: 'ex-1', name: 'Pull-Up', tags: ['Back'], bodyweightLoaded: true, sets: [] }]
+    })
+
+    it('accepts an added weight of 0 and logs it', async () => {
+      const wrapper = await openLogModalFor('Pull-Up')
+      const { weight, reps } = fields(wrapper)
+      await weight.setValue('0')
+      await reps.setValue('12')
+
+      expect(saveBtn(wrapper).attributes('disabled')).toBeUndefined()
+      await saveBtn(wrapper).trigger('click')
+      expect(mockLogSet).toHaveBeenCalledWith('ex-1', 0, 12, expect.any(String))
+    })
+
+    it('estimates the folded load, matching what logSet stores', async () => {
+      const wrapper = await openLogModalFor('Pull-Up')
+      const { weight, reps } = fields(wrapper)
+      await weight.setValue('25')
+      await reps.setValue('5')
+
+      expect(wrapper.find('.repMaxResult').text()).toContain(`${epley(BODYWEIGHT + 25, 5)} lbs`)
+    })
+
+    it('calls the field "Added" and drops the barbell placeholder', async () => {
+      const wrapper = await openLogModalFor('Pull-Up')
+      expect(fields(wrapper).weight.attributes('placeholder')).toBe('0')
+      expect(wrapper.find('[aria-labelledby="cal-modal-title"] .repMaxLabel').text()).toContain('Added')
+    })
+
+    it('still refuses 0 on a normal exercise', async () => {
+      exercises = [{ id: 'ex-2', name: 'Bench Press', tags: ['Chest'], sets: [] }]
+      const wrapper = await openLogModalFor('Bench Press')
+      const { weight, reps } = fields(wrapper)
+      await weight.setValue('0')
+      await reps.setValue('5')
+
+      expect(saveBtn(wrapper).attributes('disabled')).toBeDefined()
+      expect(fields(wrapper).weight.attributes('placeholder')).toBe('135')
+    })
+  })
+
+  /**
+   * The backfill picker used to be a hand-rolled copy of ExercisePickerModal
+   * that had drifted from it in two user-visible ways (LIFT-1375): it listed
+   * `store.exercises` raw, so an exercise archived on the Workouts tab still
+   * showed up here, and it had no "+ New exercise" row, so a user with none
+   * got a modal with an empty body and only Cancel.
+   */
+  describe('backfill exercise picker (LIFT-1375)', () => {
+    const TODAY = todayKey()
+
+    async function openPicker() {
+      const wrapper = mountCalendar()
+      await wrapper.find('.calCellToday').trigger('click')
+      await wrapper.find('.calLogBtn').trigger('click')
+      return wrapper
+    }
+
+    const pickerNames = (wrapper: ReturnType<typeof mountCalendar>) =>
+      wrapper.findAll('.wtExPickerRow').map(b => b.text())
+
+    it('omits an exercise archived on the Workouts tab', async () => {
+      exercises = [
+        { id: 'ex-1', name: 'Bench Press', tags: ['Chest'], sets: [] },
+        { id: 'ex-2', name: 'Retired Machine Press', tags: ['Chest'], sets: [], archived_at: '2026-01-01T00:00:00Z' },
+      ]
+      const wrapper = await openPicker()
+
+      expect(pickerNames(wrapper).some(t => t.includes('Bench Press'))).toBe(true)
+      expect(pickerNames(wrapper).some(t => t.includes('Retired Machine Press'))).toBe(false)
+    })
+
+    // Archiving hides an exercise from the pickers, not from history — the
+    // calendar grid must keep rendering the sets it already holds.
+    it('still shows an archived exercise\'s logged sets in the day detail', async () => {
+      exercises = [{
+        id: 'ex-2',
+        name: 'Retired Machine Press',
+        tags: ['Chest'],
+        archived_at: '2026-01-01T00:00:00Z',
+        sets: [{ id: 's-1', date: `${TODAY}T12:00:00`, weight: 185, reps: 5, estimated1RM: 216 }],
+      }]
+      const wrapper = mountCalendar()
+      await wrapper.find('.calCellToday').trigger('click')
+
+      expect(wrapper.find('.calExList').text()).toContain('Retired Machine Press')
+    })
+
+    // The dead end: zero exercises meant an empty list and a Cancel button.
+    it('offers a way forward when the user has no exercises at all', async () => {
+      exercises = []
+      const wrapper = await openPicker()
+
+      const rows = wrapper.findAll('.wtExPickerRow')
+      expect(rows.length).toBe(1)
+      expect(rows[0].text()).toContain('+ New exercise')
+    })
+
+    // Creation has one owner (the log sheet's new-exercise mode), so the
+    // calendar hands the intent over rather than growing a second form.
+    it('emits create-exercise and closes the picker on "+ New exercise"', async () => {
+      exercises = []
+      const wrapper = await openPicker()
+      await wrapper.find('.wtExPickerNew').trigger('click')
+
+      expect(wrapper.emitted('create-exercise')).toHaveLength(1)
+      expect(wrapper.find('[aria-labelledby="calendar-picker-title"]').exists()).toBe(false)
+    })
+
+    it('still opens the log modal for a picked exercise', async () => {
+      exercises = [{ id: 'ex-1', name: 'Bench Press', tags: ['Chest'], sets: [] }]
+      const wrapper = await openPicker()
+      await wrapper.findAll('.wtExPickerRow').find(b => b.text().includes('Bench Press'))!.trigger('click')
+
+      expect(wrapper.find('[aria-labelledby="cal-modal-title"]').exists()).toBe(true)
+      expect(wrapper.find('#cal-modal-title').text()).toBe('Bench Press')
     })
   })
 })
