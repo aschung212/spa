@@ -7,7 +7,7 @@
   --border-strong:   #3a3a30;
   --text-primary:    #eeeeee;
   --text-secondary:  #a09878;
-  --text-muted:      #807860;
+  --text-muted:      #8e856b;
   --accent:          #c8a84c;
   --accent-hover:    #d8b85c;
   --accent-subtle:   rgba(200, 168, 76, 0.10);
@@ -42,7 +42,7 @@
   --accent:          #886e20;
   --accent-hover:    #746010;
   --accent-subtle:   rgba(138, 112, 32, 0.08);
-  --danger:          #dc2626;
+  --danger:          #da2323;
   --danger-subtle:   rgba(220, 38, 38, 0.08);
   --success:         #4d7c0f;
   --success-subtle:  rgba(77, 124, 15, 0.08);
