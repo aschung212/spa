@@ -22,7 +22,7 @@
  *
  * See: https://www.w3.org/WAI/WCAG21/Understanding/contrast-minimum.html
  */
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, it, expect } from 'vitest'
 
@@ -144,15 +144,15 @@ function parseThemesFromCss(css: string): Record<string, ThemeColors> {
 const cssPath = resolve(__dirname, '../../index.css')
 const themes = parseThemesFromCss(readFileSync(cssPath, 'utf8'))
 
-/** The lazy-loaded twin of each index.css theme block. */
-const THEME_IDS = [
-  'eternal', 'fire', 'water', 'luck', 'air',
-  'amethyst', 'pearl', 'midnight', 'love', 'earth',
-] as const
+/**
+ * The lazy-loaded twin of each index.css theme block. Read off the directory
+ * rather than a theme-id list: a new theme is then audited the moment its file
+ * lands, and an enumeration can't fall behind the one it is meant to pin.
+ */
+const themesDir = resolve(__dirname, '../../themes')
 const themeFilePalettes: Record<string, ThemeColors> = {}
-for (const id of THEME_IDS) {
-  const file = resolve(__dirname, `../../themes/${id}.css`)
-  Object.assign(themeFilePalettes, parseThemesFromCss(readFileSync(file, 'utf8')))
+for (const file of readdirSync(themesDir).filter(f => f.endsWith('.css'))) {
+  Object.assign(themeFilePalettes, parseThemesFromCss(readFileSync(resolve(themesDir, file), 'utf8')))
 }
 
 // ── Contrast pair definitions ────────────────────────────────────────
