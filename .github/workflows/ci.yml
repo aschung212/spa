@@ -884,7 +884,12 @@ jobs:
             echo "::error::$STAMP is missing — vite-plugin-version-stamp did not run in the Vercel build, so smoke-test-production could never confirm this deploy."
             exit 1
           fi
-          BUILT_SHA=$(jq -r '.commit // empty' "$STAMP")
+          # `|| true` so a malformed stamp reports through the message below
+          # rather than aborting the step on jq's exit code under `set -e`:
+          # "stamped <empty>" plus jq's own stderr in the log says more than a
+          # bare non-zero exit, and the conclusion is the same either way —
+          # this bundle cannot be verified once it is live.
+          BUILT_SHA=$(jq -r '.commit // empty' "$STAMP" || true)
           if [ "$BUILT_SHA" != "$EXPECTED_SHA" ]; then
             echo "::error::version.json is stamped ${BUILT_SHA:-<empty>} but this run deploys $EXPECTED_SHA — LIFT_BUILD_COMMIT did not reach the vite build. Refusing to deploy a bundle that cannot be verified live."
             exit 1
