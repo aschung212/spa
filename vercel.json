@@ -2,6 +2,11 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "trailingSlash": false,
+  "git": {
+    "deploymentEnabled": {
+      "master": false
+    }
+  },
   "ignoreCommand": "git diff --quiet HEAD^ HEAD -- src/ public/ api/ index.html vite.config.js package.json vercel.json",
   "rewrites": [
     {

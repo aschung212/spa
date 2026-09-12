@@ -166,7 +166,7 @@ Lift lets you track any strength exercise over time. Log a set (weight + reps + 
 | **PWA** | `vite-plugin-pwa` + Workbox | Pre-caches all static assets; installable on iOS & Android |
 | **Charts** | Hand-rolled SVG | `<polyline>` + `<polygon>` computed from normalized data — no chart library |
 | **Styling** | CSS custom properties | All themes + glass tokens are a single `data-theme` attribute swap |
-| **Deployment** | Vercel | Auto-deploys on push; environment variables set in dashboard |
+| **Deployment** | Vercel | Deployed from CI after the DB migration applies; environment variables set in dashboard |
 
 ---
 
@@ -275,6 +275,8 @@ npm run preview  # preview production build locally
 ### Deploy
 
 Push to GitHub, connect to [Vercel](https://vercel.com), and add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` as environment variables in the Vercel dashboard. Enable Google as an OAuth provider in Supabase and add your Vercel domain to the allowed redirect URLs.
+
+Production is **not** deployed by Vercel's git integration: `vercel.json` sets `git.deploymentEnabled: { master: false }`, and CI's `deploy-production` job builds and deploys after `migrate-db` has applied the schema, so new code never reaches users ahead of the column it reads. PR branches still get git-integration previews as usual. That job needs three repository secrets — `VERCEL_TOKEN` (create at <https://vercel.com/account/tokens>) plus `VERCEL_ORG_ID` and `VERCEL_PROJECT_ID` (the `orgId`/`projectId` in `.vercel/project.json` after running `vercel link`). Without them nothing reaches production, so the job fails fast and says exactly that.
 
 ### Native iOS build (Capacitor)
 

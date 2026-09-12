@@ -1,5 +1,8 @@
 /// <reference types="node" />
 import { describe, it, expect } from 'vitest'
+import { spawnSync } from 'node:child_process'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { readFileSync, readdirSync, existsSync } from 'fs'
 import { resolve, join } from 'path'
 
@@ -100,6 +103,56 @@ describe('production bundle guard: dev sign-in bypass (LIFT-1123)', () => {
         return DEV_SIGNIN_MARKERS.some((marker) => contents.includes(marker))
       })
       expect(offenders).toEqual([])
+    })
+  })
+
+  // The script itself, run the way CI runs it. Nothing outside CI executed it
+  // before, so its contract was unpinned — and LIFT-1169 now depends on the
+  // directory argument: deploy-production points it at `.vercel/output/static`,
+  // the tree `vercel deploy --prebuilt` uploads, rather than assuming
+  // `vercel build` leaves `dist/` behind. Drop the argument handling and that
+  // job either scans the wrong tree or hard-fails on a missing one.
+  describe('scripts/check-no-dev-signin.js scans the directory it is given', () => {
+    const script = resolve(root, 'scripts/check-no-dev-signin.js')
+
+    function runGuard(buildDir: string) {
+      return spawnSync(process.execPath, [script, buildDir], { encoding: 'utf-8' })
+    }
+
+    function withFixture(js: string, run: (relDir: string) => void) {
+      const dir = mkdtempSync(join(tmpdir(), 'lift-guard-'))
+      try {
+        mkdirSync(join(dir, 'assets'))
+        writeFileSync(join(dir, 'assets', 'index-abc123.js'), js)
+        run(dir)
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }
+
+    it('passes on a clean bundle in the given directory', () => {
+      withFixture('export const a=1;\n', (dir) => {
+        const result = runGuard(dir)
+        expect(result.status, result.stderr).toBe(0)
+      })
+    })
+
+    it('fails when the given directory carries the bypass (non-vacuity)', () => {
+      // Without this case the test above would pass just as happily against a
+      // guard that never opened a file.
+      withFixture(`const c="${DEV_SIGNIN_MARKERS[0]}";\n`, (dir) => {
+        const result = runGuard(dir)
+        expect(result.status).not.toBe(0)
+        expect(result.stderr).toContain(DEV_SIGNIN_MARKERS[0])
+      })
+    })
+
+    it('fails loudly when the given directory does not exist', () => {
+      // A silent pass here would be the worst outcome: CI would report the
+      // deployed bundle clean having inspected nothing at all.
+      const result = runGuard(join(tmpdir(), 'lift-guard-does-not-exist'))
+      expect(result.status).not.toBe(0)
+      expect(result.stderr).toContain('not found')
     })
   })
 })

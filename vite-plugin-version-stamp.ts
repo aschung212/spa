@@ -8,14 +8,13 @@
  * (the old deploy answers 200 just fine). LIFT-1167.
  *
  * This plugin writes `dist/version.json` = `{ commit, builtAt }`, sourced from
- * the build environment's commit SHA (Vercel exposes `VERCEL_GIT_COMMIT_SHA`;
- * GitHub Actions exposes `GITHUB_SHA`). The `smoke-test-production` CI job then
+ * the build environment's commit SHA. The `smoke-test-production` CI job then
  * polls `<prod>/version.json` and only sends the success notification once the
  * *deployed* commit matches the pushed commit — genuinely verifying the deploy
  * landed rather than assuming it did.
  *
  * The commit value is read from an authoritative build-env variable, never
- * fabricated (the SEV1 rule). Locally, with neither var set, `commit` is '' —
+ * fabricated (the SEV1 rule). Locally, with no var set, `commit` is '' —
  * harmless, since local builds are never the production deploy being verified.
  */
 import type { Plugin } from 'vite'
@@ -29,14 +28,28 @@ export interface VersionInfo {
 
 /**
  * Pure derivation of the version payload — exported for unit testing.
- * Prefers Vercel's build-time SHA (the value that matters for the deploy being
- * verified), then GitHub Actions', then empty.
+ *
+ * Precedence, most authoritative first:
+ *
+ * 1. `LIFT_BUILD_COMMIT` — set explicitly by the `deploy-production` CI job to
+ *    `github.sha` (LIFT-1169). Since that job runs `vercel build` itself, the
+ *    checked-out commit is what is being deployed, and the workflow states it
+ *    rather than leaving it to be inferred. This matters because `vercel pull`
+ *    writes `.vercel/.env.production.local`, which `vercel build` injects into
+ *    the build env — so a `VERCEL_GIT_COMMIT_SHA` may be present there
+ *    describing some *other* deployment. Left to win, it would stamp a commit
+ *    production is not serving and the smoke test would poll for 300s and fail
+ *    on every deploy.
+ * 2. `VERCEL_GIT_COMMIT_SHA` — Vercel's own build-time SHA, authoritative for
+ *    the git-integration builds that still produce preview deploys.
+ * 3. `GITHUB_SHA` — any other GitHub Actions build.
  */
 export function buildVersionInfo(
   env: NodeJS.ProcessEnv = process.env,
   now: Date = new Date(),
 ): VersionInfo {
-  const commit = env.VERCEL_GIT_COMMIT_SHA || env.GITHUB_SHA || ''
+  const commit =
+    env.LIFT_BUILD_COMMIT || env.VERCEL_GIT_COMMIT_SHA || env.GITHUB_SHA || ''
   return { commit, builtAt: now.toISOString() }
 }
 

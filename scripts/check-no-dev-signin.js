@@ -18,8 +18,18 @@
  * Run against a production build only (e.g. the build-and-test CI job). Running
  * it after `VITE_E2E=true npm run build` is expected to fail.
  *
+ * The directory is an optional argument so the deploy-production job can scan
+ * `.vercel/output/static` — the artifact `vercel build` actually uploads
+ * (LIFT-1169). That build carries the real Vercel project env, so it is the
+ * only place this guard can see the misconfiguration described above; and
+ * naming the output explicitly avoids assuming `vercel build` leaves `dist/`
+ * behind rather than consuming it.
+ *
  * Usage:
- *   node scripts/check-no-dev-signin.js
+ *   node scripts/check-no-dev-signin.js [buildDir]   # default: dist
+ *
+ * `buildDir` is resolved from the repo root (not the cwd), so the same
+ * invocation works from anywhere in the tree.
  */
 
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
@@ -28,7 +38,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..');
-const distDir = resolve(root, 'dist');
+const distDir = resolve(root, process.argv[2] || 'dist');
 
 // UI markers unique to the dev sign-in button. We deliberately do NOT grep for
 // 'local-dev' / 'dev@localhost': those live in useAuth's devSignIn helper, which
@@ -45,7 +55,7 @@ if (!existsSync(distDir)) {
   process.exit(1);
 }
 
-/** Recursively collect every emitted JS file under dist/ (chunks may be lazy). */
+/** Recursively collect every emitted JS file under the build dir (chunks may be lazy). */
 function collectJsFiles(dir) {
   const out = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {

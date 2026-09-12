@@ -13,15 +13,21 @@ import { parse } from 'yaml'
 const ROOT = resolve(__dirname, '../../..')
 const CI_PATH = resolve(ROOT, '.github/workflows/ci.yml')
 
+const VERCEL_PATH = resolve(ROOT, 'vercel.json')
+
 interface Step {
+  id?: string
   name?: string
   uses?: string
+  if?: string
   run?: string
   env?: Record<string, string>
 }
 interface Job {
   needs?: string | string[]
   if?: string
+  outputs?: Record<string, string>
+  env?: Record<string, string>
   steps?: Step[]
 }
 
@@ -33,6 +39,19 @@ function loadJobs(): Record<string, Job> {
 function needsOf(job: Job | undefined): string[] {
   if (!job?.needs) return []
   return Array.isArray(job.needs) ? job.needs : [job.needs]
+}
+
+interface VercelConfig {
+  git?: { deploymentEnabled?: Record<string, boolean> }
+}
+
+function loadVercelConfig(): VercelConfig {
+  return JSON.parse(readFileSync(VERCEL_PATH, 'utf8')) as VercelConfig
+}
+
+/** Every `run:` in a job, concatenated — for "does this job do X anywhere" checks. */
+function runScriptOf(job: Job | undefined): string {
+  return (job?.steps ?? []).map((s) => s.run ?? '').join('\n')
 }
 
 describe('production deploy verification (LIFT-1167)', () => {
@@ -80,5 +99,194 @@ describe('production deploy verification (LIFT-1167)', () => {
       /notify slack/i.test(s.name ?? ''),
     )
     expect(step?.run ?? '').toContain('verified live')
+  })
+})
+
+// LIFT-1169: `migrate-db` claimed in a comment to run "before Vercel deploys",
+// but Vercel's git integration deployed on push — independently of this
+// workflow, and minutes ahead of a job that waits behind build-and-test + e2e.
+// So code depending on a fresh column went live and errored for users until the
+// migration caught up, and no ordering primitive existed that could stop it.
+//
+// The fix has two halves that are only correct together: git auto-deploy is off
+// for master (vercel.json), and CI deploys after migrate-db (ci.yml). Delete
+// either one and the repo is broken in a different direction — restore git
+// auto-deploy and the race is back; drop the CI job and master silently stops
+// reaching production. These tests pin both.
+describe('production deploys are ordered after the schema migration (LIFT-1169)', () => {
+  const jobs = loadJobs()
+  const deploy = jobs['deploy-production']
+
+  it('defines a deploy-production job', () => {
+    expect(deploy, 'ci.yml must own the production deploy').toBeDefined()
+  })
+
+  it('vercel.json turns OFF git auto-deploy for master', () => {
+    // The other half of the guarantee. With this re-enabled, Vercel would
+    // deploy the push directly again and the CI ordering would be advisory.
+    expect(loadVercelConfig().git?.deploymentEnabled?.master).toBe(false)
+  })
+
+  it('the deploy waits for migrate-db', () => {
+    expect(needsOf(deploy)).toContain('migrate-db')
+  })
+
+  it('the deploy is gated at least as narrowly as migrate-db', () => {
+    // A `needs:` edge does not stop a SKIPPED job from satisfying it — GitHub
+    // treats a skipped need as met. So if migrate-db's gate ever narrows
+    // relative to the deploy's, the deploy sails past a migration that never
+    // ran: the original bug, reintroduced through its own fix. Requiring every
+    // migrate-db clause to also gate the deploy makes that unrepresentable.
+    const clauses = (cond: string) =>
+      cond
+        .split('&&')
+        .map((c) => c.trim())
+        // `success()` is GitHub's implicit default when `if` is present without
+        // it, so stating it or not is a style choice, not a gate.
+        .filter((c) => c.length > 0 && c !== 'success()')
+
+    const migrateClauses = clauses(jobs['migrate-db']?.if ?? '')
+    expect(migrateClauses.length).toBeGreaterThan(0)
+    for (const clause of migrateClauses) {
+      expect(clauses(deploy?.if ?? '')).toContain(clause)
+    }
+  })
+
+  it('the deploy only runs on green master pushes', () => {
+    const cond = deploy?.if ?? ''
+    expect(cond).toContain('success()')
+    expect(cond).toContain("github.event_name == 'push'")
+    expect(cond).toContain("github.ref == 'refs/heads/master'")
+  })
+
+  it('deploys the prebuilt output to production', () => {
+    const script = runScriptOf(deploy)
+    // `vercel build` locally + `deploy --prebuilt` is what lets the deploy be
+    // ordered at all: a plain `vercel deploy` would hand the build back to
+    // Vercel and reopen the timing gap this issue is about.
+    expect(script).toContain('vercel build --prod')
+    expect(script).toContain('vercel deploy --prebuilt --prod')
+  })
+
+  it('stamps version.json with the commit CI checked out', () => {
+    const build = (deploy?.steps ?? []).find((s) =>
+      (s.run ?? '').includes('vercel build'),
+    )
+    // vite-plugin-version-stamp reads this first, ahead of any
+    // VERCEL_GIT_COMMIT_SHA that `vercel pull` wrote into
+    // .vercel/.env.production.local describing a different deployment. The
+    // smoke test polls for exactly this value.
+    expect(build?.env?.LIFT_BUILD_COMMIT).toBe('${{ github.sha }}')
+  })
+
+  it('fails with an actionable message when the deploy secrets are missing', () => {
+    // With git auto-deploy off, an unconfigured secret means production stops
+    // updating. That must not surface as an opaque CLI auth error.
+    const jobEnv = deploy?.env ?? {}
+    expect(jobEnv.VERCEL_TOKEN).toBe('${{ secrets.VERCEL_TOKEN }}')
+    expect(jobEnv.VERCEL_ORG_ID).toBe('${{ secrets.VERCEL_ORG_ID }}')
+    expect(jobEnv.VERCEL_PROJECT_ID).toBe('${{ secrets.VERCEL_PROJECT_ID }}')
+
+    const preflight = (deploy?.steps ?? []).find((s) =>
+      /credentials/i.test(s.name ?? ''),
+    )
+    expect(preflight, 'expected a credential preflight step').toBeDefined()
+    const run = preflight?.run ?? ''
+    for (const secret of ['VERCEL_TOKEN', 'VERCEL_ORG_ID', 'VERCEL_PROJECT_ID']) {
+      expect(run).toContain(secret)
+    }
+    expect(run).toContain('::error::')
+  })
+
+  it('refuses to deploy a bundle not stamped with this commit', () => {
+    // Whether LIFT_BUILD_COMMIT survives into the vite build is the Vercel
+    // CLI's behaviour, not this workflow's — it spawns the build with the
+    // pulled production env merged in. If it doesn't survive, version.json
+    // carries another deployment's SHA (or none) and the only symptom is
+    // smoke-test-production timing out 300s AFTER the bundle went live. The
+    // check has to precede the deploy, or it is just a slower way to learn the
+    // same thing.
+    const steps = deploy?.steps ?? []
+    const stampIdx = steps.findIndex((s) => (s.run ?? '').includes('version.json'))
+    expect(stampIdx, 'expected a version-stamp check step').toBeGreaterThan(-1)
+    expect(steps[stampIdx]?.env?.EXPECTED_SHA).toBe('${{ github.sha }}')
+    expect(steps[stampIdx]?.run ?? '').toContain('::error::')
+
+    const deployIdx = steps.findIndex((s) => (s.run ?? '').includes('vercel deploy --prebuilt'))
+    expect(deployIdx).toBeGreaterThan(-1)
+    expect(stampIdx).toBeLessThan(deployIdx)
+  })
+
+  it('re-runs the dev sign-in guard against the bundle that actually ships', () => {
+    // build-and-test runs the same guard, but on a build without Vercel's
+    // project env — so it could never catch the cause its own comment names
+    // (a VITE_E2E left set on the Vercel project). This build has that env, and
+    // the guard reads the tree `deploy --prebuilt` uploads.
+    const script = runScriptOf(deploy)
+    expect(script).toContain('check-no-dev-signin.js')
+    expect(script).toContain('.vercel/output/static')
+  })
+
+  it('skips the deploy for commits vercel.json says are not deployable', () => {
+    const gate = (deploy?.steps ?? []).find((s) => s.id === 'deploy_gate')
+    expect(gate, 'expected a deploy_gate step').toBeDefined()
+    // Executed from vercel.json rather than restated, so the deployable-path
+    // list has exactly one definition.
+    expect(gate?.run ?? '').toContain('ignoreCommand')
+    expect(deploy?.outputs?.deployed).toBe('${{ steps.deploy_gate.outputs.deploy }}')
+  })
+
+  it('the smoke test verifies the deploy this workflow made', () => {
+    expect(needsOf(jobs['smoke-test-production'])).toContain('deploy-production')
+    const verify = (jobs['smoke-test-production']?.steps ?? []).find((s) =>
+      /version|verify/i.test(s.name ?? ''),
+    )
+    // Reads the deploy job's gate output instead of re-deriving it: one
+    // derivation of "did this commit deploy", so the two cannot disagree and
+    // strand the verification job polling for a deploy that never happened.
+    expect(verify?.if ?? '').toContain('needs.deploy-production.outputs.deployed')
+  })
+
+  it('a failed deploy reaches Slack instead of going quiet', () => {
+    expect(needsOf(jobs['notify-failure'])).toContain('deploy-production')
+    expect(needsOf(jobs['notify-deploy'])).toContain('deploy-production')
+  })
+
+  it('confirms the security headers survived the new build mechanism', () => {
+    // vercel.json's headers reach production by being compiled into the
+    // deployment's routing config, and this change moved the build that does
+    // that compiling into CI. vercelHeadersRegression.test.ts only reads the
+    // source file, so a mechanism that quietly dropped the CSP would ship
+    // green — the smoke test checks the live response instead.
+    const verify = (jobs['smoke-test-production']?.steps ?? []).find((s) =>
+      /version|verify/i.test(s.name ?? ''),
+    )
+    const run = verify?.run ?? ''
+    expect(run).toContain('content-security-policy')
+    // Read off the response headers, not the body: markup that merely mentions
+    // the policy must not be able to satisfy the check.
+    expect(run).toContain('-D -')
+  })
+
+  it('retries an empty header probe instead of calling it a dropped CSP', () => {
+    // The probe curl ends in `|| true`, so a transient fetch failure and a
+    // genuinely absent header both arrive as an empty string. Conflating them
+    // fails the deploy — terminally, inside a 30-attempt loop that exists to
+    // absorb exactly this — and blames a vercel.json regression that never
+    // happened, on the one job whose purpose is to report accurately WHICH
+    // system broke. The empty case must warn and retry, like the app-shell
+    // marker check beside it; only a probe that came back and lacks the header
+    // is a real failure.
+    const verify = (jobs['smoke-test-production']?.steps ?? []).find((s) =>
+      /version|verify/i.test(s.name ?? ''),
+    )
+    const run = verify?.run ?? ''
+    const emptyProbeGuard = run.indexOf('[ -z "$HEADERS" ]')
+    expect(
+      emptyProbeGuard,
+      'expected an empty-probe branch before the CSP failure',
+    ).toBeGreaterThan(-1)
+    // …and it has to come FIRST, or the failure branch claims the empty probe.
+    expect(emptyProbeGuard).toBeLessThan(run.indexOf('no Content-Security-Policy header'))
   })
 })

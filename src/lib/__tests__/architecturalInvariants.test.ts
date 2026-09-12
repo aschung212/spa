@@ -1519,9 +1519,11 @@ describe('Invariant: every always-send NULL column is nullable in the migrations
 // It bites hardest on the account-deletion path (#1299). `delete_user_account`
 // runs LAST, after the per-table deletes have already succeeded, so a
 // name/schema mismatch there fails having already destroyed the user's rows.
-// LIFT-1169 (migrate-db racing Vercel's git auto-deploy) makes the
-// code-ahead-of-schema window real rather than theoretical, so the caller and
-// its migration have to ship in the same commit.
+// LIFT-1169 closed the *ordering* half of this — production now deploys from
+// CI behind `migrate-db`, so code can no longer go live ahead of a migration
+// that applied late. What that cannot catch is a caller shipped with no
+// migration at all, which is broken at every ordering; hence this check, and
+// hence the caller and its migration still have to ship in the same commit.
 describe('Invariant: client RPC names exist in the migrations (#1299)', () => {
   const migrationSql = stripSqlComments(
     readdirSync(MIGRATIONS_DIR)
