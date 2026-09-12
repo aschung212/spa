@@ -1003,7 +1003,11 @@ jobs:
             fi
             sleep "$SLEEP"
           done
-          echo "::error::Production never reported commit $EXPECTED_SHA within $((ATTEMPTS * SLEEP))s — the Vercel deploy likely failed or stalled"
+          # deploy-production already succeeded to get here, so this is no
+          # longer "the build probably failed" — the upload reported success
+          # and the production alias never started answering off it. Naming the
+          # wrong system is the one failure this job cannot afford.
+          echo "::error::Production never reported commit $EXPECTED_SHA within $((ATTEMPTS * SLEEP))s — deploy-production uploaded it, so the production alias is still serving the previous deployment"
           exit 1
 
   # Notify Slack on post-merge success (push to master only).
