@@ -17,7 +17,11 @@
  * pinned by behaviour, which a copy-paste rename cannot fool.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from 'vitest'
-import { takeRestTimerLaunchAction, REST_AGAIN_ACTION } from '../../composables/useRestTimerIntent'
+import {
+  takeRestTimerLaunchAction,
+  REST_AGAIN_ACTION,
+  REST_TIMER_MESSAGE_TYPE,
+} from '../../composables/useRestTimerIntent'
 
 interface FakeClient {
   focus: () => Promise<void>
@@ -96,8 +100,11 @@ describe('rest-timer notificationclick handler (LIFT-1355)', () => {
       await click({ action: REST_AGAIN_ACTION })
 
       expect(client.focus).toHaveBeenCalledOnce()
+      // Both halves of the warm channel are asserted against the client's own
+      // constants, so a rename on either side fails here rather than at 6am in
+      // someone's gym.
       expect(client.postMessage).toHaveBeenCalledWith({
-        type: 'rest-timer-action',
+        type: REST_TIMER_MESSAGE_TYPE,
         action: REST_AGAIN_ACTION,
       })
       expect(openWindow).not.toHaveBeenCalled()
