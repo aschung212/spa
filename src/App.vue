@@ -330,6 +330,8 @@ import { useAppBadge } from './composables/useAppBadge'
 import { todayISO } from './lib/dates'
 import { useOnboarding } from './composables/useOnboarding'
 import { useTabRouting } from './composables/useTabRouting'
+import { useRestTimer } from './composables/useRestTimer'
+import { takeRestTimerLaunchAction, useRestTimerIntent, REST_AGAIN_ACTION } from './composables/useRestTimerIntent'
 import { onCrossTabMessage, type StoreKey } from './lib/crossTabSync'
 import { GUEST_BACKUP_PROMPT_DISMISSED_KEY } from './composables/useAuth'
 import { decideWelcomeBack, readWelcomeBackState, markWelcomedBack, type WelcomeBackDecision } from './lib/welcomeBack'
@@ -574,6 +576,13 @@ function logFromWelcomeBack() {
 // measurable without a backend.
 captureAcquisitionSource()
 
+// ── Rest-timer notification action (LIFT-1355) ──────────────────
+// A "Rest Again" tap that had to cold-start the app carries its action in the
+// launch URL, because the service worker has no booted client to postMessage.
+// Read (and clear) it HERE, before the ?tab= cleanup below wipes the whole query
+// string — the intent is acted on from onMounted, once switchTab exists.
+const launchRestAction = takeRestTimerLaunchAction()
+
 // ── Tab routing (supports PWA manifest shortcuts via ?tab= param) ─────
 // The scrollable tab-content element, used to preserve per-tab scroll offset.
 const tabContentEl = ref<HTMLElement | null>(null)
@@ -754,7 +763,33 @@ function flushPendingAddExercise() {
   if (triggerAddExercise()) pendingAddExercise.value = false
 }
 
-watch(workoutTrackerRef, () => flushPendingAddExercise())
+/**
+ * "Rest Again" from the rest-complete notification (LIFT-1355).
+ *
+ * Same parked-intent shape as the calendar handoff above, and for a sharper
+ * version of the same reason: the request arrives from the service worker, which
+ * has no way to know whether a listener exists yet. It used to be consumed inside
+ * `useRestTimerController` — i.e. only once WorkoutTracker's async chunk had
+ * loaded and mounted — so on a cold start (the case iOS makes the common one) it
+ * landed on nothing at all. `start()` reports whether the controller was there to
+ * take it; the watcher below retries when the chunk lands.
+ */
+const { restTimerEnabled } = useRestTimer()
+const restTimerIntent = useRestTimerIntent({
+  isEnabled: () => restTimerEnabled.value,
+  reveal: () => switchTab('workouts'),
+  start: () => {
+    const ctrl = workoutTrackerRef.value?.timerCtrl
+    if (typeof ctrl?.startRestTimer !== 'function') return false
+    ctrl.startRestTimer()
+    return true
+  },
+})
+
+watch(workoutTrackerRef, () => {
+  flushPendingAddExercise()
+  restTimerIntent.flush()
+})
 
 // Flush engagement timing on page unload
 function onBeforeUnload() {
@@ -771,6 +806,11 @@ onMounted(async () => {
   // reconciliation pushes inside each store's fetch stayed parked — until the
   // user fully relaunched the app.
   teardownSyncRecovery = setupSyncRecovery()
+  // "Rest Again" on the rest-complete notification (LIFT-1355). The warm path is
+  // a service-worker message; the cold path is the launch param read in setup,
+  // which is parked here and satisfied once WorkoutTracker mounts.
+  teardownRestTimerIntent = restTimerIntent.listen()
+  if (launchRestAction === REST_AGAIN_ACTION) restTimerIntent.request()
   // Clear any badge left over from a prior session: visibilitychange does not
   // fire on cold start (the document begins visible), so a badge set before a
   // force-close would otherwise linger on the icon while the user is active.
@@ -888,6 +928,7 @@ onMounted(async () => {
 })
 let unsubCrossTab: (() => void) | null = null
 let teardownSyncRecovery: (() => void) | null = null
+let teardownRestTimerIntent: (() => void) | null = null
 onUnmounted(() => {
   window.removeEventListener('beforeunload', onBeforeUnload)
   window.removeEventListener('online', updateOnlineStatus)
@@ -896,5 +937,6 @@ onUnmounted(() => {
   clearAppBadge()
   unsubCrossTab?.()
   teardownSyncRecovery?.()
+  teardownRestTimerIntent?.()
 })
 </script>

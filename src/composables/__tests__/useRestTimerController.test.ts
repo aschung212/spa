@@ -12,13 +12,11 @@ const notifMocks = vi.hoisted(() => ({
   wasBackgrounded: { value: false },
 }))
 
-// The controller registers a service-worker "message" listener and pairs it with
-// an unconditional onUnmounted cleanup (LIFT-751). Stub onUnmounted so the bare
-// (non-component) makeController calls in this suite don't warn — mirrors useModal.test.ts.
-vi.mock('vue', async () => {
-  const actual = await vi.importActual('vue')
-  return { ...(actual as object), onUnmounted: vi.fn() }
-})
+// The controller used to register a service-worker "message" listener here with a
+// paired onUnmounted cleanup, which needed `onUnmounted` stubbed so the bare
+// (non-component) makeController calls in this suite didn't warn. That listener
+// moved to `useRestTimerIntent` in LIFT-1355 — it fired too late to be useful on a
+// cold start — and the controller now registers no lifecycle hooks of its own.
 
 vi.mock('../useNotification', () => ({
   REST_TIMER_NOTIFICATION_ACTIONS: [
@@ -559,69 +557,9 @@ describe('useRestTimerController', () => {
     })
   })
 
-  describe('service-worker "rest-again" action (LIFT-751)', () => {
-    let swListeners: Array<(event: MessageEvent) => void>
-    let originalSW: PropertyDescriptor | undefined
-
-    beforeEach(() => {
-      vi.useFakeTimers({ shouldAdvanceTime: false })
-      swListeners = []
-      originalSW = Object.getOwnPropertyDescriptor(navigator, 'serviceWorker')
-      Object.defineProperty(navigator, 'serviceWorker', {
-        value: {
-          addEventListener: (_type: string, cb: (event: MessageEvent) => void) => swListeners.push(cb),
-          removeEventListener: vi.fn(),
-        },
-        configurable: true,
-      })
-    })
-
-    afterEach(() => {
-      vi.useRealTimers()
-      if (originalSW) {
-        Object.defineProperty(navigator, 'serviceWorker', originalSW)
-      } else {
-        // @ts-expect-error clean up the stub
-        delete navigator.serviceWorker
-      }
-    })
-
-    it('restarts a fresh rest timer when the service worker posts rest-again', () => {
-      const { ctrl } = makeController()
-      ctrl.restDuration.value = 120
-      expect(ctrl.timerActive.value).toBe(false)
-      expect(swListeners.length).toBeGreaterThan(0)
-
-      swListeners.forEach((cb) =>
-        cb({ data: { type: 'rest-timer-action', action: 'rest-again' } } as MessageEvent),
-      )
-
-      expect(ctrl.timerActive.value).toBe(true)
-      expect(ctrl.timerSeconds.value).toBe(120)
-    })
-
-    it('ignores unrelated service-worker messages', () => {
-      const { ctrl } = makeController()
-
-      swListeners.forEach((cb) => {
-        cb({ data: { type: 'other-thing' } } as MessageEvent)
-        cb({ data: { type: 'rest-timer-action', action: 'something-else' } } as MessageEvent)
-        cb({ data: null } as MessageEvent)
-      })
-
-      expect(ctrl.timerActive.value).toBe(false)
-    })
-
-    it('does not restart when the rest timer has been disabled', () => {
-      const prefs = usePreferencesStore()
-      prefs.setRestTimer(false)
-      const { ctrl } = makeController()
-
-      swListeners.forEach((cb) =>
-        cb({ data: { type: 'rest-timer-action', action: 'rest-again' } } as MessageEvent),
-      )
-
-      expect(ctrl.timerActive.value).toBe(false)
-    })
-  })
+  // The "rest-again" service-worker action moved out of the controller in
+  // LIFT-1355 — a listener registered in WorkoutTracker's setup does not exist
+  // yet on the cold start the action is tapped from. Its behaviour (including the
+  // disabled-preference guard these tests covered) now lives in
+  // useRestTimerIntent.test.ts, alongside the launch-URL channel that replaced it.
 })

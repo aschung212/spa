@@ -1,4 +1,4 @@
-import { ref, computed, watch, onUnmounted, type Ref, type ComputedRef } from 'vue'
+import { ref, computed, watch, type Ref, type ComputedRef } from 'vue'
 import { usePreferencesStore } from '../stores/preferences'
 import { useNotification, useBackgroundTracker, REST_TIMER_NOTIFICATION_ACTIONS } from './useNotification'
 import { useRestTimer } from './useRestTimer'
@@ -78,7 +78,7 @@ export function useRestTimerController(
   const prefs = usePreferencesStore()
   const { notify: sendNotification, requestPermission: requestNotificationPermission } = useNotification()
   const { wasBackgrounded, startTracking: startBgTracking, stopTracking: stopBgTracking } = useBackgroundTracker()
-  const { restTimerEnabled, setRestTimerEnabled } = useRestTimer()
+  const { setRestTimerEnabled } = useRestTimer()
 
   const presets = useRestTimerPresets()
   const alerts = useRestTimerAlerts()
@@ -174,25 +174,16 @@ export function useRestTimerController(
     startInterval()
   }
 
-  // ── Notification action buttons (LIFT-751) ────────────────────
-  // The "Rest Again" button on the completion notification is handled in the
-  // service worker (public/sw-notification-handler.js), which focuses the app and
-  // posts this message. Restart a fresh rest so the user can extend their break
-  // without reopening the log sheet. Respect the user's rest-timer preference: a
-  // lingering notification must not restart a timer the user has since disabled.
-  function handleServiceWorkerMessage(event: MessageEvent) {
-    const data = event.data
-    if (data?.type === 'rest-timer-action' && data.action === 'rest-again' && restTimerEnabled.value) {
-      startRestTimer()
-    }
-  }
-  // Registration and cleanup are paired unconditionally (matching useBackgroundTracker /
-  // useModal) so the listener can never outlive the controller. The controller is only
-  // ever instantiated in WorkoutTracker's setup, so onUnmounted has an owning instance.
-  navigator.serviceWorker?.addEventListener('message', handleServiceWorkerMessage)
-  onUnmounted(() => {
-    navigator.serviceWorker?.removeEventListener('message', handleServiceWorkerMessage)
-  })
+  // ── Notification action buttons (LIFT-751 / LIFT-1355) ────────
+  // The "Rest Again" button on the completion notification used to be handled
+  // right here, by a `navigator.serviceWorker` message listener registered in
+  // this function's body. That listener only exists once WorkoutTracker's setup
+  // has run, and WorkoutTracker is an async component behind the auth gate — so
+  // the case the button exists for (iOS reclaimed the backgrounded PWA, the tap
+  // has to cold-start the app) posted into a client with nothing listening.
+  // `useRestTimerIntent`, owned by App.vue, now parks the request and calls
+  // `startRestTimer()` through WorkoutTracker's exposed controller once it
+  // mounts — and can surface the Workouts tab first, which this could not.
 
   function togglePause() {
     alerts.ensureAudio()
