@@ -7,6 +7,14 @@
  * loses, or renames a token, this suite either re-audits the real value or
  * fails loudly on the missing token.
  *
+ * That single-source claim only holds because of the parity guard below: every
+ * theme ALSO exists as src/themes/<id>.css, which is what `loadThemeCSS`
+ * injects at runtime and what `vite-plugin-theme-split` leaves behind after it
+ * strips the non-eternal blocks out of the bundled index.css. For 9 of the 10
+ * themes the per-theme file is the palette that actually renders, so an audit
+ * that reads index.css alone would be measuring dead CSS the moment the two
+ * copies diverged (LIFT-1096).
+ *
  * Checks every critical text/background pair against WCAG AA thresholds:
  *   - Normal text (< 18px): 4.5:1
  *   - Large text (≥ 18px or ≥ 14px bold): 3:1
@@ -14,7 +22,7 @@
  *
  * See: https://www.w3.org/WAI/WCAG21/Understanding/contrast-minimum.html
  */
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, it, expect } from 'vitest'
 
@@ -136,6 +144,17 @@ function parseThemesFromCss(css: string): Record<string, ThemeColors> {
 const cssPath = resolve(__dirname, '../../index.css')
 const themes = parseThemesFromCss(readFileSync(cssPath, 'utf8'))
 
+/**
+ * The lazy-loaded twin of each index.css theme block. Read off the directory
+ * rather than a theme-id list: a new theme is then audited the moment its file
+ * lands, and an enumeration can't fall behind the one it is meant to pin.
+ */
+const themesDir = resolve(__dirname, '../../themes')
+const themeFilePalettes: Record<string, ThemeColors> = {}
+for (const file of readdirSync(themesDir).filter(f => f.endsWith('.css'))) {
+  Object.assign(themeFilePalettes, parseThemesFromCss(readFileSync(resolve(themesDir, file), 'utf8')))
+}
+
 // ── Contrast pair definitions ────────────────────────────────────────
 
 interface ContrastPair {
@@ -146,33 +165,69 @@ interface ContrastPair {
   min: number
 }
 
+/**
+ * The three RESTING reading surfaces. Anything that renders text below
+ * 18px (or 14px bold) on one of them owes the full 4.5:1, whatever tier of the
+ * type scale it belongs to.
+ */
+const RESTING: { name: string; bg: (t: ThemeColors) => string }[] = [
+  { name: 'bg-primary',   bg: t => t.bgPrimary },
+  { name: 'bg-secondary', bg: t => t.bgSecondary },
+  { name: 'bg-elevated',  bg: t => t.bgElevated },
+]
+
+/** `fg` on all three resting surfaces at the normal-text floor. */
+function onEveryRestingSurface(
+  token: string,
+  fg: (t: ThemeColors) => string,
+): ContrastPair[] {
+  return RESTING.map(s => ({ label: `${token} on ${s.name}`, fg, bg: s.bg, min: 4.5 }))
+}
+
 const normalText: ContrastPair[] = [
   // Primary body text sits on every surface — cards/modals/rows use bg-elevated,
   // hovered/pressed rows use bg-hover.
-  { label: 'text-primary on bg-primary',   fg: t => t.textPrimary,   bg: t => t.bgPrimary,   min: 4.5 },
-  { label: 'text-primary on bg-secondary', fg: t => t.textPrimary,   bg: t => t.bgSecondary, min: 4.5 },
-  { label: 'text-primary on bg-elevated',  fg: t => t.textPrimary,   bg: t => t.bgElevated,  min: 4.5 },
+  ...onEveryRestingSurface('text-primary', t => t.textPrimary),
   { label: 'text-primary on bg-hover',     fg: t => t.textPrimary,   bg: t => t.bgHover,     min: 4.5 },
   // Secondary text (subtitles, metadata) renders on the primary/secondary/elevated
   // resting surfaces — all require the full 4.5:1 for normal-size text.
-  { label: 'text-secondary on bg-primary', fg: t => t.textSecondary, bg: t => t.bgPrimary,   min: 4.5 },
-  { label: 'text-secondary on bg-secondary', fg: t => t.textSecondary, bg: t => t.bgSecondary, min: 4.5 },
-  { label: 'text-secondary on bg-elevated',  fg: t => t.textSecondary, bg: t => t.bgElevated,  min: 4.5 },
+  ...onEveryRestingSurface('text-secondary', t => t.textSecondary),
+  // --text-muted is the de-emphasis tier, not an exemption from AA. It carries ~100
+  // `color:` declarations and all but a handful render at 11-15px: empty states
+  // (.wtEmpty, .calDetailEmpty, .wtSetEmpty), settings hints and footers, stat
+  // labels, dates, placeholders. Classifying it large-text-only held real body copy
+  // to 3:1 — and every dark variant sat under 4.5:1 on bg-elevated, down to
+  // amethyst-dark's 2.87:1 (LIFT-1096).
+  ...onEveryRestingSurface('text-muted', t => t.textMuted),
+  // --danger and --success are semantic TEXT colours as often as they are fills:
+  // .settingsSignOut (15px), .deleteConfirmError (12px), .wtClearBtn (13px),
+  // .wtPrBadge (11px), .wtSet1RM (15px), .wtPRConnector (12px). None of those reach
+  // the large-text threshold, so 3:1 never applied to them either.
+  ...onEveryRestingSurface('danger', t => t.danger),
+  ...onEveryRestingSurface('success', t => t.success),
   { label: 'text-on-accent on accent',     fg: t => t.textOnAccent,  bg: t => t.accent,      min: 4.5 },
 ]
 
 const largeText: ContrastPair[] = [
   // bg-hover is a *transient* pressed/hover feedback surface, not a resting reading
-  // surface. Primary text on it still gets the full 4.5:1 guard; secondary text on a
-  // momentary hover background is held to the 3:1 large/UI floor.
+  // surface. Primary text on it still gets the full 4.5:1 guard; the de-emphasised
+  // tiers on a momentary hover background are held to the 3:1 large/UI floor.
   { label: 'text-secondary on bg-hover (transient)', fg: t => t.textSecondary, bg: t => t.bgHover, min: 3 },
-  { label: 'text-muted on bg-primary (large)',   fg: t => t.textMuted, bg: t => t.bgPrimary,   min: 3 },
-  { label: 'text-muted on bg-secondary (large)', fg: t => t.textMuted, bg: t => t.bgSecondary, min: 3 },
+  { label: 'text-muted on bg-hover (transient)',     fg: t => t.textMuted,     bg: t => t.bgHover, min: 3 },
+  { label: 'danger on bg-hover (transient)',         fg: t => t.danger,        bg: t => t.bgHover, min: 3 },
+  { label: 'success on bg-hover (transient)',        fg: t => t.success,       bg: t => t.bgHover, min: 3 },
   { label: 'accent on bg-primary (large)',        fg: t => t.accent,   bg: t => t.bgPrimary,   min: 3 },
   { label: 'accent on bg-secondary (large)',      fg: t => t.accent,   bg: t => t.bgSecondary, min: 3 },
-  { label: 'danger on bg-primary (large)',        fg: t => t.danger,   bg: t => t.bgPrimary,   min: 3 },
-  { label: 'success on bg-primary (large)',       fg: t => t.success,  bg: t => t.bgPrimary,   min: 3 },
 ]
+
+/**
+ * --text-muted must stay *visibly* quieter than --text-secondary, or raising it to
+ * the AA floor silently deletes a tier of the type scale. The light variants set the
+ * house style: muted pinned just over 4.5:1 on the worst-case resting surface, with
+ * secondary 1.2-1.4 ratio points above it. Anything under a full point apart reads
+ * as one tone.
+ */
+const MIN_TIER_SEPARATION = 1.0
 
 // ── Tests ────────────────────────────────────────────────────────────
 
@@ -183,8 +238,36 @@ describe('theme contrast audit (WCAG 2.1 AA)', () => {
     expect(Object.keys(themes).length).toBe(20)
   })
 
+  // Auditing index.css only proves anything about the running app while the
+  // lazy-loaded twin agrees with it. `loadThemeCSS` appends src/themes/<id>.css
+  // as a <link> AFTER the bundled stylesheet — equal specificity, later in source
+  // order, so it wins — and the build plugin deletes the non-eternal blocks from
+  // the bundled index.css outright. Without this, a token fixed in one file and
+  // missed in the other reads as a clean pass on a palette no user ever sees.
+  it('every theme file matches its index.css block token-for-token', () => {
+    expect(Object.keys(themeFilePalettes).length).toBe(20)
+    for (const [name, fileColors] of Object.entries(themeFilePalettes)) {
+      expect(themes[name], `src/themes has ${name}, index.css does not`).toBeDefined()
+      expect(fileColors, `src/themes/*.css and index.css disagree for ${name}`).toEqual(themes[name])
+    }
+  })
+
   for (const [name, colors] of Object.entries(themes)) {
     describe(name, () => {
+      // De-emphasis has to survive the AA floor, not be erased by it.
+      it(`text-muted stays a tier below text-secondary`, () => {
+        for (const surface of RESTING) {
+          const bg = surface.bg(colors)
+          const muted = contrastRatio(colors.textMuted, bg)
+          const secondary = contrastRatio(colors.textSecondary, bg)
+          expect(
+            secondary - muted,
+            `${surface.name}: text-secondary ${secondary.toFixed(2)}:1 vs text-muted ` +
+              `${muted.toFixed(2)}:1 — the two tiers render as one tone`,
+          ).toBeGreaterThanOrEqual(MIN_TIER_SEPARATION)
+        }
+      })
+
       for (const pair of normalText) {
         it(`${pair.label} ≥ ${pair.min}:1`, () => {
           const ratio = contrastRatio(pair.fg(colors), pair.bg(colors))
